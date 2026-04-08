@@ -19,8 +19,9 @@ body {
 
 #app {
   display: grid;
-  grid-template-columns: minmax(320px, 400px) minmax(420px, 1fr) minmax(360px, 460px);
+  grid-template-columns: minmax(320px, 390px) minmax(520px, 1fr) minmax(340px, 420px);
   gap: 22px;
+  align-items: start;
   min-height: 100vh;
   padding: 22px;
 }
@@ -186,6 +187,7 @@ input {
   position: relative;
   overflow: hidden;
   padding: 18px;
+  display: flex;
 }
 
 .canvas-shell,
@@ -197,15 +199,17 @@ input {
     linear-gradient(135deg, rgba(127, 90, 240, 0.08), transparent 35%),
     linear-gradient(315deg, rgba(47, 170, 104, 0.08), transparent 35%),
     #fbfbfd;
+  aspect-ratio: 1 / 1;
+  width: 100%;
 }
 
 .canvas-shell {
-  min-height: 760px;
-  height: 100%;
+  max-height: min(calc(100vh - 80px), 960px);
+  margin: 0 auto;
 }
 
 .replay-shell {
-  min-height: 420px;
+  max-width: 100%;
 }
 
 canvas {
@@ -313,11 +317,15 @@ input[type="range"] {
 
 @media (max-width: 1440px) {
   #app {
-    grid-template-columns: minmax(320px, 380px) minmax(400px, 1fr);
+    grid-template-columns: minmax(300px, 360px) minmax(420px, 1fr);
   }
 
   .replay-panel {
     grid-column: 1 / -1;
+  }
+
+  .replay-shell {
+    max-width: 720px;
   }
 }
 
@@ -327,6 +335,6 @@ input[type="range"] {
   }
 
   .canvas-shell {
-    min-height: 520px;
+    max-height: none;
   }
 }
