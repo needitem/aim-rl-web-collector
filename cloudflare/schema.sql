@@ -13,5 +13,11 @@ CREATE TABLE IF NOT EXISTS session_traces (
   FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(created_at DESC);
+CREATE TABLE IF NOT EXISTS upload_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ip_address TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 
+CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_upload_events_ip_created_at ON upload_events(ip_address, created_at DESC);

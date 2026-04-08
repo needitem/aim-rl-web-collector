@@ -30,6 +30,19 @@ type SessionSummary = {
   frame_count: number;
   episode_count: number;
   created_at: string;
+  meta?: Record<string, unknown>;
+};
+
+type AdminStats = {
+  session_count: number;
+  stored_frame_count: number;
+  sources: Array<{ source: string; session_count: number; frame_count: number }>;
+  upload_limits: {
+    hourly_limit: number;
+    minute_limit: number;
+    recent_uploads_from_ip: number;
+    recent_hour_uploads_from_ip: number;
+  };
 };
 
 type WorldState = {
@@ -69,17 +82,21 @@ let running = false;
 let episode = 0;
 let frames: Frame[] = [];
 let summaries: SessionSummary[] = [];
+let selectedSessionId: string | null = null;
+let replayFrames: Frame[] = [];
+let replayIndex = 0;
+let replayPlaying = false;
 let pointerX = 0;
 let pointerY = 0;
 let lastTimestamp = 0;
+let replayTimestamp = 0;
 let statusMessage = "Ready";
 let rngSeed = 17;
+let adminStats: AdminStats | null = null;
 let state = resetState();
 
 const app = document.querySelector<HTMLDivElement>("#app");
-if (!app) {
-  throw new Error("App root not found.");
-}
+if (!app) throw new Error("App root not found.");
 
 app.innerHTML = `
   <section class="panel sidebar">
@@ -87,8 +104,8 @@ app.innerHTML = `
       <p class="eyebrow">Browser Collector</p>
       <h1>Aim RL Web Arena</h1>
       <p class="lede">
-        Move your mouse like a game. The browser records target motion, your cursor
-        response, and lead-aim metrics into uploadable session traces.
+        Collect human aim traces, upload them to the backend, inspect stored sessions,
+        and replay captured motion without leaving the browser.
       </p>
     </div>
 
@@ -106,7 +123,10 @@ app.innerHTML = `
         API Base URL
         <input id="api-base" value="${DEFAULT_API}" />
       </label>
-      <button id="refresh-sessions" class="ghost">Refresh Saved Sessions</button>
+      <div class="button-row">
+        <button id="refresh-admin" class="ghost">Refresh Admin</button>
+        <button id="clear-replay" class="ghost">Clear Replay</button>
+      </div>
     </div>
 
     <div class="metrics">
@@ -120,9 +140,14 @@ app.innerHTML = `
       </div>
     </div>
 
+    <div class="admin-block">
+      <strong>Admin Snapshot</strong>
+      <div id="admin-stats" class="admin-stats"></div>
+    </div>
+
     <div class="sessions">
-      <strong>Uploaded Sessions</strong>
-      <ol id="session-list" class="session-list"></ol>
+      <strong>Stored Sessions</strong>
+      <ul id="session-list" class="session-list"></ul>
     </div>
 
     <p id="status-line" class="footer-note">Ready</p>
@@ -137,45 +162,59 @@ app.innerHTML = `
       </div>
     </div>
   </section>
+
+  <section class="panel replay-panel">
+    <div class="replay-header">
+      <div>
+        <p class="eyebrow">Replay Viewer</p>
+        <h2 id="replay-title">No Session Loaded</h2>
+      </div>
+      <div class="button-row">
+        <button id="replay-toggle" class="secondary" disabled>Play</button>
+        <button id="replay-download" class="ghost" disabled>Download Trace</button>
+      </div>
+    </div>
+
+    <div class="replay-shell">
+      <canvas id="replay-canvas" width="720" height="720"></canvas>
+    </div>
+
+    <div class="replay-controls">
+      <input id="replay-slider" type="range" min="0" max="0" value="0" disabled />
+      <div class="replay-meta">
+        <span id="replay-step">step 0 / 0</span>
+        <span id="replay-distance">distance 0.000</span>
+      </div>
+    </div>
+  </section>
 `;
 
-const canvas = document.querySelector<HTMLCanvasElement>("#arena");
-const ctx = canvas?.getContext("2d");
-const modeEl = document.querySelector<HTMLElement>("#metric-mode");
-const episodeEl = document.querySelector<HTMLElement>("#metric-episode");
-const framesEl = document.querySelector<HTMLElement>("#metric-frames");
-const distanceEl = document.querySelector<HTMLElement>("#metric-distance");
-const forwardEl = document.querySelector<HTMLElement>("#metric-forward");
-const rewardEl = document.querySelector<HTMLElement>("#metric-reward");
-const statusEl = document.querySelector<HTMLElement>("#status-line");
-const sessionListEl = document.querySelector<HTMLOListElement>("#session-list");
-const apiInput = document.querySelector<HTMLInputElement>("#api-base");
-const toggleRunButton = document.querySelector<HTMLButtonElement>("#toggle-run");
-const resetButton = document.querySelector<HTMLButtonElement>("#reset-episode");
-const saveButton = document.querySelector<HTMLButtonElement>("#save-local");
-const uploadButton = document.querySelector<HTMLButtonElement>("#upload-session");
-const refreshButton = document.querySelector<HTMLButtonElement>("#refresh-sessions");
-
-if (
-  !canvas ||
-  !ctx ||
-  !modeEl ||
-  !episodeEl ||
-  !framesEl ||
-  !distanceEl ||
-  !forwardEl ||
-  !rewardEl ||
-  !statusEl ||
-  !sessionListEl ||
-  !apiInput ||
-  !toggleRunButton ||
-  !resetButton ||
-  !saveButton ||
-  !uploadButton ||
-  !refreshButton
-) {
-  throw new Error("Required DOM nodes are missing.");
-}
+const canvas = getRequired<HTMLCanvasElement>("#arena");
+const ctx = get2d(canvas);
+const replayCanvas = getRequired<HTMLCanvasElement>("#replay-canvas");
+const replayCtx = get2d(replayCanvas);
+const apiInput = getRequired<HTMLInputElement>("#api-base");
+const toggleRunButton = getRequired<HTMLButtonElement>("#toggle-run");
+const resetButton = getRequired<HTMLButtonElement>("#reset-episode");
+const saveButton = getRequired<HTMLButtonElement>("#save-local");
+const uploadButton = getRequired<HTMLButtonElement>("#upload-session");
+const refreshButton = getRequired<HTMLButtonElement>("#refresh-admin");
+const clearReplayButton = getRequired<HTMLButtonElement>("#clear-replay");
+const replayToggleButton = getRequired<HTMLButtonElement>("#replay-toggle");
+const replayDownloadButton = getRequired<HTMLButtonElement>("#replay-download");
+const replaySlider = getRequired<HTMLInputElement>("#replay-slider");
+const modeEl = getRequired<HTMLElement>("#metric-mode");
+const episodeEl = getRequired<HTMLElement>("#metric-episode");
+const framesEl = getRequired<HTMLElement>("#metric-frames");
+const distanceEl = getRequired<HTMLElement>("#metric-distance");
+const forwardEl = getRequired<HTMLElement>("#metric-forward");
+const rewardEl = getRequired<HTMLElement>("#metric-reward");
+const statusEl = getRequired<HTMLElement>("#status-line");
+const adminStatsEl = getRequired<HTMLElement>("#admin-stats");
+const sessionListEl = getRequired<HTMLElement>("#session-list");
+const replayTitleEl = getRequired<HTMLElement>("#replay-title");
+const replayStepEl = getRequired<HTMLElement>("#replay-step");
+const replayDistanceEl = getRequired<HTMLElement>("#replay-distance");
 
 canvas.addEventListener("mousemove", (event) => {
   const rect = canvas.getBoundingClientRect();
@@ -184,13 +223,16 @@ canvas.addEventListener("mousemove", (event) => {
 });
 
 window.addEventListener("keydown", (event) => {
+  const key = event.key.toLowerCase();
   if (event.code === "Space") {
     event.preventDefault();
     toggleRun();
-  } else if (event.key.toLowerCase() === "r") {
+  } else if (key === "r") {
     resetEpisode();
-  } else if (event.key.toLowerCase() === "u") {
+  } else if (key === "u") {
     void uploadSession();
+  } else if (key === "p" && replayFrames.length > 0) {
+    toggleReplay();
   }
 });
 
@@ -198,28 +240,42 @@ toggleRunButton.addEventListener("click", () => toggleRun());
 resetButton.addEventListener("click", () => resetEpisode());
 saveButton.addEventListener("click", () => downloadSession());
 uploadButton.addEventListener("click", () => void uploadSession());
-refreshButton.addEventListener("click", () => void fetchSessions());
+refreshButton.addEventListener("click", () => void refreshAdmin());
+clearReplayButton.addEventListener("click", () => clearReplay());
+replayToggleButton.addEventListener("click", () => toggleReplay());
+replayDownloadButton.addEventListener("click", () => void downloadReplayTrace());
+replaySlider.addEventListener("input", () => {
+  replayIndex = Number(replaySlider.value);
+  replayPlaying = false;
+  syncReplayControls();
+});
 
 pointerX = state.cursorX;
 pointerY = state.cursorY;
-render();
-void fetchSessions();
+renderLive();
+renderReplay();
+void refreshAdmin();
 requestAnimationFrame(loop);
 
 function loop(timestamp: number): void {
-  if (lastTimestamp === 0) {
-    lastTimestamp = timestamp;
-  }
+  if (lastTimestamp === 0) lastTimestamp = timestamp;
+  if (replayTimestamp === 0) replayTimestamp = timestamp;
 
   if (running && timestamp - lastTimestamp >= DT * 1000) {
     const steps = Math.max(1, Math.floor((timestamp - lastTimestamp) / (DT * 1000)));
-    for (let index = 0; index < steps; index += 1) {
-      tick();
-    }
+    for (let index = 0; index < steps; index += 1) tick();
     lastTimestamp = timestamp;
   }
 
-  render();
+  if (replayPlaying && replayFrames.length > 0 && timestamp - replayTimestamp >= DT * 1000) {
+    replayIndex = Math.min(replayIndex + 1, replayFrames.length - 1);
+    if (replayIndex >= replayFrames.length - 1) replayPlaying = false;
+    replayTimestamp = timestamp;
+    syncReplayControls();
+  }
+
+  renderLive();
+  renderReplay();
   requestAnimationFrame(loop);
 }
 
@@ -253,25 +309,13 @@ function tick(): void {
   const impliedAx = clip(state.cursorVx - previousCursorVx, -MAX_ACTION, MAX_ACTION);
   const impliedAy = clip(state.cursorVy - previousCursorVy, -MAX_ACTION, MAX_ACTION);
 
-  state.targetVx = clip(
-    state.targetVx + randomRange(-TARGET_ACCEL_NOISE, TARGET_ACCEL_NOISE) * DT,
-    -TARGET_MAX_SPEED,
-    TARGET_MAX_SPEED,
-  );
-  state.targetVy = clip(
-    state.targetVy + randomRange(-TARGET_ACCEL_NOISE, TARGET_ACCEL_NOISE) * DT,
-    -TARGET_MAX_SPEED,
-    TARGET_MAX_SPEED,
-  );
+  state.targetVx = clip(state.targetVx + randomRange(-TARGET_ACCEL_NOISE, TARGET_ACCEL_NOISE) * DT, -TARGET_MAX_SPEED, TARGET_MAX_SPEED);
+  state.targetVy = clip(state.targetVy + randomRange(-TARGET_ACCEL_NOISE, TARGET_ACCEL_NOISE) * DT, -TARGET_MAX_SPEED, TARGET_MAX_SPEED);
 
   const nextTargetX = state.targetX + state.targetVx * DT;
   const nextTargetY = state.targetY + state.targetVy * DT;
-  if (nextTargetX > WORLD_X || nextTargetX < -WORLD_X) {
-    state.targetVx *= -1;
-  }
-  if (nextTargetY > WORLD_Y || nextTargetY < -WORLD_Y) {
-    state.targetVy *= -1;
-  }
+  if (nextTargetX > WORLD_X || nextTargetX < -WORLD_X) state.targetVx *= -1;
+  if (nextTargetY > WORLD_Y || nextTargetY < -WORLD_Y) state.targetVy *= -1;
   state.targetX = clip(state.targetX + state.targetVx * DT, -WORLD_X, WORLD_X);
   state.targetY = clip(state.targetY + state.targetVy * DT, -WORLD_Y, WORLD_Y);
 
@@ -354,70 +398,107 @@ function resetState(): WorldState {
   };
 }
 
-function render(): void {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  const gradient = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
+function renderLive(): void {
+  drawArena(ctx, canvas.width, canvas.height, currentLiveFrame(), state.targetX, state.targetY, state.cursorX, state.cursorY);
+}
+
+function renderReplay(): void {
+  drawArena(replayCtx, replayCanvas.width, replayCanvas.height, replayFrames[replayIndex], null, null, null, null);
+}
+
+function currentLiveFrame(): Frame | undefined {
+  return frames[frames.length - 1];
+}
+
+function drawArena(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  frame: Frame | undefined,
+  liveTargetX: number | null,
+  liveTargetY: number | null,
+  liveCursorX: number | null,
+  liveCursorY: number | null,
+): void {
+  context.clearRect(0, 0, width, height);
+  const gradient = context.createLinearGradient(0, 0, width, height);
   gradient.addColorStop(0, "#fefefe");
   gradient.addColorStop(1, "#eef3ff");
-  ctx.fillStyle = gradient;
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  context.fillStyle = gradient;
+  context.fillRect(0, 0, width, height);
+  drawGrid(context, width, height);
 
-  const target = worldToCanvas(state.targetX, state.targetY);
-  const cursor = worldToCanvas(state.cursorX, state.cursorY);
-  const lead = worldToCanvas(
-    clip(state.targetX + state.targetVx * REWARD_LEAD_TIME, -WORLD_X, WORLD_X),
-    clip(state.targetY + state.targetVy * REWARD_LEAD_TIME, -WORLD_Y, WORLD_Y),
-  );
+  const targetX = frame ? frame.target_x : liveTargetX;
+  const targetY = frame ? frame.target_y : liveTargetY;
+  const cursorX = frame ? frame.cursor_x : liveCursorX;
+  const cursorY = frame ? frame.cursor_y : liveCursorY;
+  const leadX = frame?.lead_x ?? null;
+  const leadY = frame?.lead_y ?? null;
 
-  drawGrid();
-  drawCircle(target.x, target.y, TARGET_RADIUS, "#f39c12", 2);
-  drawCircle(target.x, target.y, HIT_RADIUS, "#8e44ad", 2);
-  drawCircle(target.x, target.y, 0.012, "#d7263d", 0, true);
-  drawCircle(lead.x, lead.y, 0.009, "#2faa68", 2);
-  drawCross(cursor.x, cursor.y, 14, "#1f4fff");
+  if (targetX == null || targetY == null || cursorX == null || cursorY == null) return;
+
+  const target = worldToCanvas(targetX, targetY, width, height);
+  const cursor = worldToCanvas(cursorX, cursorY, width, height);
+  drawCircle(context, target.x, target.y, TARGET_RADIUS, "#f39c12", 2, width);
+  drawCircle(context, target.x, target.y, HIT_RADIUS, "#8e44ad", 2, width);
+  drawCircle(context, target.x, target.y, 0.012, "#d7263d", 0, width, true);
+  if (leadX != null && leadY != null) {
+    const lead = worldToCanvas(leadX, leadY, width, height);
+    drawCircle(context, lead.x, lead.y, 0.009, "#2faa68", 2, width);
+  }
+  drawCross(context, cursor.x, cursor.y, Math.max(12, width / 60), "#1f4fff");
 }
 
-function drawGrid(): void {
-  ctx.strokeStyle = "rgba(31, 36, 48, 0.08)";
-  ctx.lineWidth = 1;
+function drawGrid(context: CanvasRenderingContext2D, width: number, height: number): void {
+  context.strokeStyle = "rgba(31, 36, 48, 0.08)";
+  context.lineWidth = 1;
   for (let index = 1; index < 8; index += 1) {
     const ratio = index / 8;
-    const x = ratio * canvas.width;
-    const y = ratio * canvas.height;
-    ctx.beginPath();
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, canvas.height);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(0, y);
-    ctx.lineTo(canvas.width, y);
-    ctx.stroke();
+    const x = ratio * width;
+    const y = ratio * height;
+    context.beginPath();
+    context.moveTo(x, 0);
+    context.lineTo(x, height);
+    context.stroke();
+    context.beginPath();
+    context.moveTo(0, y);
+    context.lineTo(width, y);
+    context.stroke();
   }
 }
 
-function drawCircle(x: number, y: number, radiusWorld: number, color: string, width: number, fill = false): void {
-  const radius = (radiusWorld / WORLD_X) * canvas.width * 0.5;
-  ctx.beginPath();
-  ctx.arc(x, y, radius, 0, Math.PI * 2);
+function drawCircle(
+  context: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  radiusWorld: number,
+  color: string,
+  width: number,
+  canvasWidth: number,
+  fill = false,
+): void {
+  const radius = (radiusWorld / WORLD_X) * canvasWidth * 0.5;
+  context.beginPath();
+  context.arc(x, y, radius, 0, Math.PI * 2);
   if (fill) {
-    ctx.fillStyle = color;
-    ctx.fill();
+    context.fillStyle = color;
+    context.fill();
   } else {
-    ctx.strokeStyle = color;
-    ctx.lineWidth = width;
-    ctx.stroke();
+    context.strokeStyle = color;
+    context.lineWidth = width;
+    context.stroke();
   }
 }
 
-function drawCross(x: number, y: number, size: number, color: string): void {
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 2.5;
-  ctx.beginPath();
-  ctx.moveTo(x - size, y);
-  ctx.lineTo(x + size, y);
-  ctx.moveTo(x, y - size);
-  ctx.lineTo(x, y + size);
-  ctx.stroke();
+function drawCross(context: CanvasRenderingContext2D, x: number, y: number, size: number, color: string): void {
+  context.strokeStyle = color;
+  context.lineWidth = 2.5;
+  context.beginPath();
+  context.moveTo(x - size, y);
+  context.lineTo(x + size, y);
+  context.moveTo(x, y - size);
+  context.lineTo(x, y + size);
+  context.stroke();
 }
 
 function updateMetrics(frame?: Frame): void {
@@ -428,10 +509,6 @@ function updateMetrics(frame?: Frame): void {
   forwardEl.textContent = frame ? frame.forward_offset.toFixed(3) : "0.000";
   rewardEl.textContent = frame ? frame.reward.toFixed(3) : "0.000";
   statusEl.textContent = statusMessage;
-}
-
-function lastFrame(): Frame | undefined {
-  return frames[frames.length - 1];
 }
 
 function sessionPayload(): { source: string; frames: Frame[]; meta: Record<string, unknown> } {
@@ -451,77 +528,188 @@ function sessionPayload(): { source: string; frames: Frame[]; meta: Record<strin
 function downloadSession(): void {
   if (frames.length === 0) {
     statusMessage = "No frames collected yet";
-    updateMetrics(lastFrame());
+    updateMetrics(currentLiveFrame());
     return;
   }
-
-  const jsonl = frames.map((frame) => JSON.stringify(frame)).join("\n");
-  const blob = new Blob([jsonl], { type: "application/jsonl" });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = `human-web-${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`;
-  anchor.click();
-  URL.revokeObjectURL(url);
+  downloadJsonl(frames, `human-web-${stamp()}.jsonl`);
   statusMessage = "Downloaded JSONL session";
-  updateMetrics(lastFrame());
+  updateMetrics(currentLiveFrame());
 }
 
 async function uploadSession(): Promise<void> {
   if (frames.length === 0) {
     statusMessage = "No frames to upload";
-    updateMetrics(lastFrame());
+    updateMetrics(currentLiveFrame());
     return;
   }
-
   statusMessage = "Uploading session";
-  updateMetrics(lastFrame());
-  const response = await fetch(`${apiInput.value.replace(/\/$/, "")}/api/sessions`, {
+  updateMetrics(currentLiveFrame());
+  const response = await fetch(`${apiBase()}/api/sessions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(sessionPayload()),
   });
-
   if (!response.ok) {
-    statusMessage = `Upload failed: ${response.status}`;
-    updateMetrics(lastFrame());
+    const text = await response.text();
+    statusMessage = `Upload failed: ${response.status} ${text}`;
+    updateMetrics(currentLiveFrame());
     return;
   }
-
   statusMessage = "Session uploaded";
-  updateMetrics(lastFrame());
-  await fetchSessions();
+  updateMetrics(currentLiveFrame());
+  await refreshAdmin();
+}
+
+async function refreshAdmin(): Promise<void> {
+  await Promise.all([fetchSessions(), fetchAdminStats()]);
 }
 
 async function fetchSessions(): Promise<void> {
-  const response = await fetch(`${apiInput.value.replace(/\/$/, "")}/api/sessions`);
+  const response = await fetch(`${apiBase()}/api/sessions`);
   if (!response.ok) {
     statusMessage = `Session list failed: ${response.status}`;
-    updateMetrics(lastFrame());
+    updateMetrics(currentLiveFrame());
     return;
   }
-
   const payload = (await response.json()) as { sessions: SessionSummary[] };
   summaries = payload.sessions;
   renderSessions();
-  statusMessage = `Loaded ${summaries.length} saved sessions`;
-  updateMetrics(lastFrame());
+  if (selectedSessionId && !summaries.some((summary) => summary.session_id === selectedSessionId)) {
+    clearReplay();
+  }
+}
+
+async function fetchAdminStats(): Promise<void> {
+  const response = await fetch(`${apiBase()}/api/admin/stats`);
+  if (!response.ok) {
+    statusMessage = `Admin stats failed: ${response.status}`;
+    updateMetrics(currentLiveFrame());
+    return;
+  }
+  adminStats = (await response.json()) as AdminStats;
+  renderAdminStats();
+  statusMessage = `Loaded ${summaries.length} sessions`;
+  updateMetrics(currentLiveFrame());
+}
+
+function renderAdminStats(): void {
+  if (!adminStats) {
+    adminStatsEl.innerHTML = "<p>No stats yet.</p>";
+    return;
+  }
+  const sourceLines = adminStats.sources
+    .map((entry) => `<li>${entry.source}: ${entry.session_count} sessions / ${entry.frame_count} frames</li>`)
+    .join("");
+  adminStatsEl.innerHTML = `
+    <div class="stat-row"><span>Total sessions</span><strong>${adminStats.session_count}</strong></div>
+    <div class="stat-row"><span>Total frames</span><strong>${adminStats.stored_frame_count}</strong></div>
+    <div class="stat-row"><span>Minute uploads from you</span><strong>${adminStats.upload_limits.recent_uploads_from_ip}</strong></div>
+    <div class="stat-row"><span>Hour uploads from you</span><strong>${adminStats.upload_limits.recent_hour_uploads_from_ip}</strong></div>
+    <div class="footer-note">
+      Rate limit: ${adminStats.upload_limits.minute_limit}/min, ${adminStats.upload_limits.hourly_limit}/hour
+    </div>
+    <ul class="source-breakdown">${sourceLines}</ul>
+  `;
 }
 
 function renderSessions(): void {
   sessionListEl.innerHTML = summaries
-    .slice(0, 8)
-    .map(
-      (summary) =>
-        `<li><strong>${summary.session_id}</strong><br />${summary.source} · ${summary.frame_count} frames · ${summary.episode_count} episodes</li>`,
-    )
+    .slice(0, 20)
+    .map((summary) => {
+      const selected = summary.session_id === selectedSessionId ? " selected" : "";
+      return `
+        <li class="session-item${selected}">
+          <button class="session-button" data-session-id="${summary.session_id}">
+            <strong>${summary.session_id}</strong>
+            <span>${summary.source} · ${summary.frame_count} frames · ${summary.episode_count} episodes</span>
+          </button>
+        </li>
+      `;
+    })
     .join("");
+  document.querySelectorAll<HTMLButtonElement>(".session-button").forEach((button) => {
+    button.addEventListener("click", () => void loadReplay(button.dataset.sessionId || ""));
+  });
 }
 
-function worldToCanvas(worldX: number, worldY: number): { x: number; y: number } {
+async function loadReplay(sessionId: string): Promise<void> {
+  if (!sessionId) return;
+  const response = await fetch(`${apiBase()}/api/sessions/${sessionId}/jsonl`);
+  if (!response.ok) {
+    statusMessage = `Replay load failed: ${response.status}`;
+    updateMetrics(currentLiveFrame());
+    return;
+  }
+  const payload = (await response.json()) as { content: string };
+  replayFrames = payload.content
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as Frame);
+  selectedSessionId = sessionId;
+  replayIndex = 0;
+  replayPlaying = false;
+  syncReplayControls();
+  renderSessions();
+  statusMessage = `Loaded replay ${sessionId}`;
+  updateMetrics(currentLiveFrame());
+}
+
+function clearReplay(): void {
+  selectedSessionId = null;
+  replayFrames = [];
+  replayIndex = 0;
+  replayPlaying = false;
+  syncReplayControls();
+  renderSessions();
+  statusMessage = "Replay cleared";
+  updateMetrics(currentLiveFrame());
+}
+
+function syncReplayControls(): void {
+  const hasReplay = replayFrames.length > 0;
+  replayToggleButton.disabled = !hasReplay;
+  replayDownloadButton.disabled = !hasReplay;
+  replaySlider.disabled = !hasReplay;
+  replaySlider.max = String(Math.max(0, replayFrames.length - 1));
+  replaySlider.value = String(replayIndex);
+  replayTitleEl.textContent = hasReplay ? `Replay ${selectedSessionId}` : "No Session Loaded";
+  replayToggleButton.textContent = replayPlaying ? "Pause" : "Play";
+  const frame = replayFrames[replayIndex];
+  replayStepEl.textContent = hasReplay ? `step ${frame.step} / ${replayFrames[replayFrames.length - 1].step}` : "step 0 / 0";
+  replayDistanceEl.textContent = hasReplay ? `distance ${frame.distance.toFixed(3)} · forward ${frame.forward_offset.toFixed(3)}` : "distance 0.000";
+}
+
+function toggleReplay(): void {
+  if (replayFrames.length === 0) return;
+  replayPlaying = !replayPlaying;
+  replayTimestamp = 0;
+  syncReplayControls();
+}
+
+async function downloadReplayTrace(): Promise<void> {
+  if (replayFrames.length === 0 || !selectedSessionId) return;
+  downloadJsonl(replayFrames, `${selectedSessionId}.jsonl`);
+}
+
+function downloadJsonl(rows: Frame[], filename: string): void {
+  const jsonl = rows.map((row) => JSON.stringify(row)).join("\n");
+  const blob = new Blob([jsonl], { type: "application/jsonl" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+function apiBase(): string {
+  return apiInput.value.replace(/\/$/, "");
+}
+
+function worldToCanvas(worldX: number, worldY: number, width: number, height: number): { x: number; y: number } {
   return {
-    x: ((worldX / WORLD_X) + 1) * 0.5 * canvas.width,
-    y: (1 - ((worldY / WORLD_Y) + 1) * 0.5) * canvas.height,
+    x: ((worldX / WORLD_X) + 1) * 0.5 * width,
+    y: (1 - ((worldY / WORLD_Y) + 1) * 0.5) * height,
   };
 }
 
@@ -550,4 +738,20 @@ function hypot(x: number, y: number): number {
 function round(value: number, digits: number): number {
   const scale = 10 ** digits;
   return Math.round(value * scale) / scale;
+}
+
+function stamp(): string {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+function getRequired<T extends Element>(selector: string): T {
+  const element = document.querySelector<T>(selector);
+  if (!element) throw new Error(`Missing DOM node: ${selector}`);
+  return element;
+}
+
+function get2d(target: HTMLCanvasElement): CanvasRenderingContext2D {
+  const context = target.getContext("2d");
+  if (!context) throw new Error("2d context unavailable");
+  return context;
 }

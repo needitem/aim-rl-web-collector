@@ -20,6 +20,7 @@ class ApiTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             api_main.DATA_DIR = Path(temp_dir)
             api_main.ensure_storage()
+            api_main.UPLOAD_HISTORY.clear()
             client = TestClient(api_main.app)
 
             payload = {
@@ -70,6 +71,56 @@ class ApiTest(unittest.TestCase):
             trace_response = client.get(f"/api/sessions/{metadata['session_id']}/jsonl")
             self.assertEqual(trace_response.status_code, 200)
             self.assertIn("\"source\":\"unit-test\"", trace_response.json()["content"])
+
+            stats_response = client.get("/api/admin/stats")
+            self.assertEqual(stats_response.status_code, 200)
+            stats = stats_response.json()
+            self.assertEqual(stats["session_count"], 1)
+            self.assertEqual(stats["stored_frame_count"], 1)
+            self.assertEqual(stats["sources"][0]["source"], "unit-test")
+
+    def test_rate_limit_blocks_excess_uploads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api_main.DATA_DIR = Path(temp_dir)
+            api_main.ensure_storage()
+            api_main.UPLOAD_HISTORY.clear()
+            client = TestClient(api_main.app)
+            payload = {
+                "source": "unit-test",
+                "frames": [
+                    {
+                        "episode": 1,
+                        "step": 1,
+                        "t": 0.0167,
+                        "cursor_x": 0.0,
+                        "cursor_y": 0.0,
+                        "cursor_vx": 0.0,
+                        "cursor_vy": 0.0,
+                        "target_x": 0.1,
+                        "target_y": -0.1,
+                        "target_vx": 0.01,
+                        "target_vy": 0.02,
+                        "lead_x": 0.11,
+                        "lead_y": -0.08,
+                        "action_x": 0.2,
+                        "action_y": -0.1,
+                        "distance": 0.3,
+                        "lead_distance": 0.2,
+                        "forward_offset": 0.05,
+                        "desired_forward_offset": 0.04,
+                        "reward": 1.2,
+                        "source": "unit-test",
+                    }
+                ],
+                "meta": {},
+            }
+
+            for _ in range(api_main.UPLOAD_LIMIT_PER_MINUTE):
+                response = client.post("/api/sessions", json=payload)
+                self.assertEqual(response.status_code, 200)
+
+            blocked = client.post("/api/sessions", json=payload)
+            self.assertEqual(blocked.status_code, 429)
 
 
 if __name__ == "__main__":
