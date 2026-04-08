@@ -75,6 +75,15 @@ type WorldState = {
   consecutiveHits: number;
 };
 
+type SessionStats = {
+  rewardSum: number;
+  hitFrames: number;
+  trackFrames: number;
+  minDistance: number;
+  leadQualitySum: number;
+  frameCount: number;
+};
+
 const DT = 1 / 60;
 const WORLD_X = 1.0;
 const WORLD_Y = 1.0;
@@ -110,6 +119,9 @@ let rngSeed = 17;
 let adminStats: AdminStats | null = null;
 let state = resetState();
 let playerName = window.localStorage.getItem("aim-rl-player-name") || "anonymous";
+let sessionStats = createEmptySessionStats();
+let leaderboardRenderKey = "";
+let sessionListRenderKey = "";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 if (!app) throw new Error("App root not found.");
@@ -276,6 +288,20 @@ replaySlider.addEventListener("input", () => {
   replayPlaying = false;
   syncReplayControls();
 });
+leaderboardEl.addEventListener("click", (event) => {
+  const target = event.target as HTMLElement | null;
+  const button = target?.closest<HTMLButtonElement>(".leaderboard-button");
+  if (button?.dataset.sessionId) {
+    void loadReplay(button.dataset.sessionId);
+  }
+});
+sessionListEl.addEventListener("click", (event) => {
+  const target = event.target as HTMLElement | null;
+  const button = target?.closest<HTMLButtonElement>(".session-button");
+  if (button?.dataset.sessionId) {
+    void loadReplay(button.dataset.sessionId);
+  }
+});
 playerNameInput.addEventListener("input", () => {
   playerName = sanitizePlayerName(playerNameInput.value);
   playerNameInput.value = playerName;
@@ -401,6 +427,7 @@ function tick(): void {
     reward: round(reward, 6),
     source: "human-web",
   });
+  updateSessionStats(frames[frames.length - 1]);
 
   if (state.stepCount >= EPISODE_STEPS || state.consecutiveHits >= 8) {
     resetEpisode();
@@ -539,7 +566,7 @@ function updateMetrics(frame?: Frame): void {
   framesEl.textContent = String(frames.length);
   distanceEl.textContent = frame ? frame.distance.toFixed(3) : "0.000";
   forwardEl.textContent = frame ? frame.forward_offset.toFixed(3) : "0.000";
-  scoreEl.textContent = String(computeScore(frames));
+  scoreEl.textContent = String(currentScore());
   statusEl.textContent = statusMessage;
 }
 
@@ -553,28 +580,45 @@ function sessionPayload(): { source: string; frames: Frame[]; meta: Record<strin
       frame_count: frames.length,
       client: "aim-rl-web",
       created_at: new Date().toISOString(),
-      score: computeScore(frames),
+      score: currentScore(),
       player_name: playerName,
-      best_distance: frames.length ? Math.min(...frames.map((frame) => frame.distance)) : 0,
-      hit_frames: frames.filter((frame) => frame.distance <= HIT_RADIUS).length,
-      track_frames: frames.filter((frame) => frame.distance <= TARGET_RADIUS).length,
+      best_distance: sessionStats.frameCount > 0 ? sessionStats.minDistance : 0,
+      hit_frames: sessionStats.hitFrames,
+      track_frames: sessionStats.trackFrames,
     },
   };
 }
 
 function computeScore(rows: Frame[]): number {
   if (rows.length === 0) return 0;
-  const rewardSum = rows.reduce((sum, frame) => sum + frame.reward, 0);
-  const hitFrames = rows.filter((frame) => frame.distance <= HIT_RADIUS).length;
-  const trackFrames = rows.filter((frame) => frame.distance <= TARGET_RADIUS).length;
-  const minDistance = Math.min(...rows.map((frame) => frame.distance));
-  const leadQuality = rows.reduce(
-    (sum, frame) => sum + Math.max(0, 1 - Math.abs(frame.forward_offset - frame.desired_forward_offset)),
-    0,
-  ) / rows.length;
+  const stats = rows.reduce((acc, frame) => {
+    acc.rewardSum += frame.reward;
+    acc.hitFrames += frame.distance <= HIT_RADIUS ? 1 : 0;
+    acc.trackFrames += frame.distance <= TARGET_RADIUS ? 1 : 0;
+    acc.minDistance = Math.min(acc.minDistance, frame.distance);
+    acc.leadQualitySum += Math.max(0, 1 - Math.abs(frame.forward_offset - frame.desired_forward_offset));
+    acc.frameCount += 1;
+    return acc;
+  }, createEmptySessionStats());
+  return scoreFromStats(stats);
+}
+
+function currentScore(): number {
+  return scoreFromStats(sessionStats);
+}
+
+function scoreFromStats(stats: SessionStats): number {
+  if (stats.frameCount === 0) return 0;
+  const leadQuality = stats.leadQualitySum / stats.frameCount;
   return Math.max(
     0,
-    Math.round(rewardSum + hitFrames * 45 + trackFrames * 8 + (1 - minDistance) * 180 + leadQuality * 120),
+    Math.round(
+      stats.rewardSum +
+        stats.hitFrames * 45 +
+        stats.trackFrames * 8 +
+        (1 - stats.minDistance) * 180 +
+        leadQuality * 120,
+    ),
   );
 }
 
@@ -668,9 +712,19 @@ function renderAdminStats(): void {
 
 function renderLeaderboard(): void {
   if (!adminStats) {
-    leaderboardEl.innerHTML = "";
+    if (leaderboardRenderKey !== "") {
+      leaderboardEl.innerHTML = "";
+      leaderboardRenderKey = "";
+    }
     return;
   }
+  const nextKey = JSON.stringify(
+    adminStats.leaderboard.slice(0, 10).map((entry) => [entry.session_id, entry.player_name, entry.score, entry.frame_count]),
+  );
+  if (nextKey === leaderboardRenderKey) {
+    return;
+  }
+  leaderboardRenderKey = nextKey;
   leaderboardEl.innerHTML = adminStats.leaderboard
     .slice(0, 10)
     .map(
@@ -678,12 +732,22 @@ function renderLeaderboard(): void {
         `<li><button class="leaderboard-button" data-session-id="${entry.session_id}"><strong>#${index + 1} ${entry.score} · ${entry.player_name ?? "anonymous"}</strong><span>${entry.source} · ${entry.frame_count} frames</span></button></li>`,
     )
     .join("");
-  document.querySelectorAll<HTMLButtonElement>(".leaderboard-button").forEach((button) => {
-    button.addEventListener("click", () => void loadReplay(button.dataset.sessionId || ""));
-  });
 }
 
 function renderSessions(): void {
+  const nextKey = JSON.stringify(
+    summaries.slice(0, 20).map((summary) => [
+      summary.session_id,
+      summary.player_name,
+      summary.score,
+      summary.frame_count,
+      summary.session_id === selectedSessionId,
+    ]),
+  );
+  if (nextKey === sessionListRenderKey) {
+    return;
+  }
+  sessionListRenderKey = nextKey;
   sessionListEl.innerHTML = summaries
     .slice(0, 20)
     .map((summary) => {
@@ -698,9 +762,6 @@ function renderSessions(): void {
       `;
     })
     .join("");
-  document.querySelectorAll<HTMLButtonElement>(".session-button").forEach((button) => {
-    button.addEventListener("click", () => void loadReplay(button.dataset.sessionId || ""));
-  });
 }
 
 async function loadReplay(sessionId: string): Promise<void> {
@@ -822,6 +883,26 @@ function sanitizePlayerName(value: string): string {
     .join("")
     .trim();
   return (cleaned || "anonymous").slice(0, 24);
+}
+
+function createEmptySessionStats(): SessionStats {
+  return {
+    rewardSum: 0,
+    hitFrames: 0,
+    trackFrames: 0,
+    minDistance: 1,
+    leadQualitySum: 0,
+    frameCount: 0,
+  };
+}
+
+function updateSessionStats(frame: Frame): void {
+  sessionStats.rewardSum += frame.reward;
+  sessionStats.hitFrames += frame.distance <= HIT_RADIUS ? 1 : 0;
+  sessionStats.trackFrames += frame.distance <= TARGET_RADIUS ? 1 : 0;
+  sessionStats.minDistance = Math.min(sessionStats.minDistance, frame.distance);
+  sessionStats.leadQualitySum += Math.max(0, 1 - Math.abs(frame.forward_offset - frame.desired_forward_offset));
+  sessionStats.frameCount += 1;
 }
 
 function lastFrame(): Frame | undefined {
