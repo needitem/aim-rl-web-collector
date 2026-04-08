@@ -30,13 +30,26 @@ type SessionSummary = {
   frame_count: number;
   episode_count: number;
   created_at: string;
+  score?: number;
   meta?: Record<string, unknown>;
+};
+
+type LeaderboardEntry = {
+  session_id: string;
+  source: string;
+  score: number;
+  frame_count: number;
+  episode_count: number;
+  created_at: string;
 };
 
 type AdminStats = {
   session_count: number;
   stored_frame_count: number;
-  sources: Array<{ source: string; session_count: number; frame_count: number }>;
+  average_score: number;
+  top_score: number;
+  leaderboard: LeaderboardEntry[];
+  sources: Array<{ source: string; session_count: number; frame_count: number; average_score: number }>;
   upload_limits: {
     hourly_limit: number;
     minute_limit: number;
@@ -104,8 +117,8 @@ app.innerHTML = `
       <p class="eyebrow">Browser Collector</p>
       <h1>Aim RL Web Arena</h1>
       <p class="lede">
-        Collect human aim traces, upload them to the backend, inspect stored sessions,
-        and replay captured motion without leaving the browser.
+        Collect human aim traces, compete on score, upload sessions, and replay top runs
+        without leaving the browser.
       </p>
     </div>
 
@@ -136,13 +149,18 @@ app.innerHTML = `
         <div class="metric"><span>Frames</span><strong id="metric-frames">0</strong></div>
         <div class="metric"><span>Distance</span><strong id="metric-distance">0.000</strong></div>
         <div class="metric"><span>Lead Offset</span><strong id="metric-forward">0.000</strong></div>
-        <div class="metric"><span>Reward</span><strong id="metric-reward">0.000</strong></div>
+        <div class="metric"><span>Score</span><strong id="metric-score">0</strong></div>
       </div>
     </div>
 
     <div class="admin-block">
       <strong>Admin Snapshot</strong>
       <div id="admin-stats" class="admin-stats"></div>
+    </div>
+
+    <div class="leaderboard-block">
+      <strong>Leaderboard</strong>
+      <ol id="leaderboard-list" class="leaderboard-list"></ol>
     </div>
 
     <div class="sessions">
@@ -158,7 +176,7 @@ app.innerHTML = `
       <canvas id="arena" width="960" height="960"></canvas>
       <div class="canvas-overlay">
         <div class="badge">Orange = track zone, violet = hit zone, green = lead point</div>
-        <div class="hint">Space start/pause, R reset, U upload</div>
+        <div class="hint">Space start/pause, R reset, U upload, P replay</div>
       </div>
     </div>
   </section>
@@ -208,9 +226,10 @@ const episodeEl = getRequired<HTMLElement>("#metric-episode");
 const framesEl = getRequired<HTMLElement>("#metric-frames");
 const distanceEl = getRequired<HTMLElement>("#metric-distance");
 const forwardEl = getRequired<HTMLElement>("#metric-forward");
-const rewardEl = getRequired<HTMLElement>("#metric-reward");
+const scoreEl = getRequired<HTMLElement>("#metric-score");
 const statusEl = getRequired<HTMLElement>("#status-line");
 const adminStatsEl = getRequired<HTMLElement>("#admin-stats");
+const leaderboardEl = getRequired<HTMLElement>("#leaderboard-list");
 const sessionListEl = getRequired<HTMLElement>("#session-list");
 const replayTitleEl = getRequired<HTMLElement>("#replay-title");
 const replayStepEl = getRequired<HTMLElement>("#replay-step");
@@ -507,7 +526,7 @@ function updateMetrics(frame?: Frame): void {
   framesEl.textContent = String(frames.length);
   distanceEl.textContent = frame ? frame.distance.toFixed(3) : "0.000";
   forwardEl.textContent = frame ? frame.forward_offset.toFixed(3) : "0.000";
-  rewardEl.textContent = frame ? frame.reward.toFixed(3) : "0.000";
+  scoreEl.textContent = String(computeScore(frames));
   statusEl.textContent = statusMessage;
 }
 
@@ -521,8 +540,28 @@ function sessionPayload(): { source: string; frames: Frame[]; meta: Record<strin
       frame_count: frames.length,
       client: "aim-rl-web",
       created_at: new Date().toISOString(),
+      score: computeScore(frames),
+      best_distance: frames.length ? Math.min(...frames.map((frame) => frame.distance)) : 0,
+      hit_frames: frames.filter((frame) => frame.distance <= HIT_RADIUS).length,
+      track_frames: frames.filter((frame) => frame.distance <= TARGET_RADIUS).length,
     },
   };
+}
+
+function computeScore(rows: Frame[]): number {
+  if (rows.length === 0) return 0;
+  const rewardSum = rows.reduce((sum, frame) => sum + frame.reward, 0);
+  const hitFrames = rows.filter((frame) => frame.distance <= HIT_RADIUS).length;
+  const trackFrames = rows.filter((frame) => frame.distance <= TARGET_RADIUS).length;
+  const minDistance = Math.min(...rows.map((frame) => frame.distance));
+  const leadQuality = rows.reduce(
+    (sum, frame) => sum + Math.max(0, 1 - Math.abs(frame.forward_offset - frame.desired_forward_offset)),
+    0,
+  ) / rows.length;
+  return Math.max(
+    0,
+    Math.round(rewardSum + hitFrames * 45 + trackFrames * 8 + (1 - minDistance) * 180 + leadQuality * 120),
+  );
 }
 
 function downloadSession(): void {
@@ -574,9 +613,7 @@ async function fetchSessions(): Promise<void> {
   const payload = (await response.json()) as { sessions: SessionSummary[] };
   summaries = payload.sessions;
   renderSessions();
-  if (selectedSessionId && !summaries.some((summary) => summary.session_id === selectedSessionId)) {
-    clearReplay();
-  }
+  if (selectedSessionId && !summaries.some((summary) => summary.session_id === selectedSessionId)) clearReplay();
 }
 
 async function fetchAdminStats(): Promise<void> {
@@ -588,6 +625,7 @@ async function fetchAdminStats(): Promise<void> {
   }
   adminStats = (await response.json()) as AdminStats;
   renderAdminStats();
+  renderLeaderboard();
   statusMessage = `Loaded ${summaries.length} sessions`;
   updateMetrics(currentLiveFrame());
 }
@@ -598,18 +636,37 @@ function renderAdminStats(): void {
     return;
   }
   const sourceLines = adminStats.sources
-    .map((entry) => `<li>${entry.source}: ${entry.session_count} sessions / ${entry.frame_count} frames</li>`)
+    .map(
+      (entry) =>
+        `<li>${entry.source}: ${entry.session_count} sessions / ${entry.frame_count} frames / avg ${entry.average_score.toFixed(1)}</li>`,
+    )
     .join("");
   adminStatsEl.innerHTML = `
     <div class="stat-row"><span>Total sessions</span><strong>${adminStats.session_count}</strong></div>
     <div class="stat-row"><span>Total frames</span><strong>${adminStats.stored_frame_count}</strong></div>
+    <div class="stat-row"><span>Average score</span><strong>${adminStats.average_score.toFixed(1)}</strong></div>
+    <div class="stat-row"><span>Top score</span><strong>${adminStats.top_score}</strong></div>
     <div class="stat-row"><span>Minute uploads from you</span><strong>${adminStats.upload_limits.recent_uploads_from_ip}</strong></div>
-    <div class="stat-row"><span>Hour uploads from you</span><strong>${adminStats.upload_limits.recent_hour_uploads_from_ip}</strong></div>
-    <div class="footer-note">
-      Rate limit: ${adminStats.upload_limits.minute_limit}/min, ${adminStats.upload_limits.hourly_limit}/hour
-    </div>
+    <div class="footer-note">Rate limit: ${adminStats.upload_limits.minute_limit}/min, ${adminStats.upload_limits.hourly_limit}/hour</div>
     <ul class="source-breakdown">${sourceLines}</ul>
   `;
+}
+
+function renderLeaderboard(): void {
+  if (!adminStats) {
+    leaderboardEl.innerHTML = "";
+    return;
+  }
+  leaderboardEl.innerHTML = adminStats.leaderboard
+    .slice(0, 10)
+    .map(
+      (entry, index) =>
+        `<li><button class="leaderboard-button" data-session-id="${entry.session_id}"><strong>#${index + 1} ${entry.score}</strong><span>${entry.source} · ${entry.frame_count} frames</span></button></li>`,
+    )
+    .join("");
+  document.querySelectorAll<HTMLButtonElement>(".leaderboard-button").forEach((button) => {
+    button.addEventListener("click", () => void loadReplay(button.dataset.sessionId || ""));
+  });
 }
 
 function renderSessions(): void {
@@ -621,7 +678,7 @@ function renderSessions(): void {
         <li class="session-item${selected}">
           <button class="session-button" data-session-id="${summary.session_id}">
             <strong>${summary.session_id}</strong>
-            <span>${summary.source} · ${summary.frame_count} frames · ${summary.episode_count} episodes</span>
+            <span>${summary.source} · ${summary.score ?? 0} pts · ${summary.frame_count} frames</span>
           </button>
         </li>
       `;
@@ -742,6 +799,10 @@ function round(value: number, digits: number): number {
 
 function stamp(): string {
   return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+function lastFrame(): Frame | undefined {
+  return frames[frames.length - 1];
 }
 
 function getRequired<T extends Element>(selector: string): T {

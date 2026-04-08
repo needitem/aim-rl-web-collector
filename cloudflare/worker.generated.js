@@ -55,6 +55,13 @@ async function countUploads(env, ipAddress, sinceIso) {
   return Number(result?.count || 0);
 }
 
+function sessionScore(payload) {
+  if (payload.meta && payload.meta.score !== undefined) {
+    return Number(payload.meta.score || 0);
+  }
+  return Math.max(0, Math.round((payload.frames || []).reduce((sum, frame) => sum + Number(frame.reward || 0), 0)));
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -103,18 +110,20 @@ export default {
       const sessionId = crypto.randomUUID().replaceAll("-", "").slice(0, 12);
       const createdAt = now.toISOString();
       const episodeCount = new Set(payload.frames.map((frame) => frame.episode)).size;
+      const score = sessionScore(payload);
       const metaJson = JSON.stringify({ ...(payload.meta || {}), ip_hash_hint: ipAddress.slice(-6) });
       const jsonl = sessionJsonl(payload.frames);
 
       await env.DB.prepare(
-        `INSERT INTO sessions (session_id, source, frame_count, episode_count, created_at, meta_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)`
+        `INSERT INTO sessions (session_id, source, frame_count, episode_count, created_at, score, meta_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`
       ).bind(
         sessionId,
         payload.source || "unknown",
         payload.frames.length,
         episodeCount,
         createdAt,
+        score,
         metaJson
       ).run();
 
@@ -132,6 +141,7 @@ export default {
         frame_count: payload.frames.length,
         episode_count: episodeCount,
         created_at: createdAt,
+        score,
         meta: payload.meta || {},
       }, {
         headers: { "access-control-allow-origin": "*" },
@@ -140,12 +150,18 @@ export default {
 
     if (url.pathname === "/api/admin/stats" && request.method === "GET") {
       const sourceResult = await env.DB.prepare(
-        `SELECT source, COUNT(*) AS session_count, SUM(frame_count) AS frame_count
+        `SELECT source, COUNT(*) AS session_count, SUM(frame_count) AS frame_count, AVG(score) AS average_score
          FROM sessions GROUP BY source ORDER BY session_count DESC`
       ).all();
       const summaryResult = await env.DB.prepare(
-        `SELECT COUNT(*) AS session_count, COALESCE(SUM(frame_count), 0) AS stored_frame_count FROM sessions`
+        `SELECT COUNT(*) AS session_count, COALESCE(SUM(frame_count), 0) AS stored_frame_count,
+                COALESCE(AVG(score), 0) AS average_score, COALESCE(MAX(score), 0) AS top_score
+         FROM sessions`
       ).first();
+      const leaderboardResult = await env.DB.prepare(
+        `SELECT session_id, source, score, frame_count, episode_count, created_at
+         FROM sessions ORDER BY score DESC, created_at DESC LIMIT 10`
+      ).all();
       const now = new Date();
       const minuteAgo = new Date(now.getTime() - 60 * 1000).toISOString();
       const hourAgo = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
@@ -154,10 +170,21 @@ export default {
       return json({
         session_count: Number(summaryResult?.session_count || 0),
         stored_frame_count: Number(summaryResult?.stored_frame_count || 0),
+        average_score: Number(summaryResult?.average_score || 0),
+        top_score: Number(summaryResult?.top_score || 0),
+        leaderboard: (leaderboardResult.results || []).map((row) => ({
+          session_id: row.session_id,
+          source: row.source,
+          score: Number(row.score || 0),
+          frame_count: Number(row.frame_count || 0),
+          episode_count: Number(row.episode_count || 0),
+          created_at: row.created_at,
+        })),
         sources: (sourceResult.results || []).map((row) => ({
           source: row.source,
           session_count: Number(row.session_count || 0),
           frame_count: Number(row.frame_count || 0),
+          average_score: Number(row.average_score || 0),
         })),
         upload_limits: {
           minute_limit: UPLOAD_LIMIT_PER_MINUTE,
@@ -172,7 +199,7 @@ export default {
 
     if (url.pathname === "/api/sessions" && request.method === "GET") {
       const result = await env.DB.prepare(
-        `SELECT session_id, source, frame_count, episode_count, created_at, meta_json
+        `SELECT session_id, source, frame_count, episode_count, created_at, score, meta_json
          FROM sessions ORDER BY created_at DESC LIMIT 50`
       ).all();
 
@@ -182,9 +209,29 @@ export default {
         frame_count: row.frame_count,
         episode_count: row.episode_count,
         created_at: row.created_at,
+        score: Number(row.score || 0),
         meta: JSON.parse(row.meta_json || "{}"),
       }));
       return json({ sessions }, {
+        headers: { "access-control-allow-origin": "*" },
+      });
+    }
+
+    if (url.pathname === "/api/leaderboard" && request.method === "GET") {
+      const result = await env.DB.prepare(
+        `SELECT session_id, source, score, frame_count, episode_count, created_at
+         FROM sessions ORDER BY score DESC, created_at DESC LIMIT 25`
+      ).all();
+      return json({
+        leaderboard: (result.results || []).map((row) => ({
+          session_id: row.session_id,
+          source: row.source,
+          score: Number(row.score || 0),
+          frame_count: Number(row.frame_count || 0),
+          episode_count: Number(row.episode_count || 0),
+          created_at: row.created_at,
+        })),
+      }, {
         headers: { "access-control-allow-origin": "*" },
       });
     }
@@ -209,7 +256,7 @@ export default {
       }
 
       const row = await env.DB.prepare(
-        `SELECT session_id, source, frame_count, episode_count, created_at, meta_json
+        `SELECT session_id, source, frame_count, episode_count, created_at, score, meta_json
          FROM sessions WHERE session_id = ?1`
       ).bind(sessionId).first();
       if (!row) {
@@ -222,6 +269,7 @@ export default {
         frame_count: row.frame_count,
         episode_count: row.episode_count,
         created_at: row.created_at,
+        score: Number(row.score || 0),
         meta: JSON.parse(row.meta_json || "{}"),
       }, {
         headers: { "access-control-allow-origin": "*" },

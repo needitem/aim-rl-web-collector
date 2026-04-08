@@ -55,6 +55,8 @@ FastAPI backend at `http://127.0.0.1:8000`.
 The browser UI now includes:
 
 - live collection arena
+- live session score
+- leaderboard
 - admin stats snapshot
 - stored session browser
 - replay viewer with play/pause, scrub, and JSONL download
@@ -97,6 +99,7 @@ Public upload safeguards in the deployed worker:
 - upload rate limit: `6/minute`, `30/hour` per IP
 - session metadata plus raw trace stored in D1
 - admin stats endpoint: `/api/admin/stats`
+- leaderboard endpoint: `/api/leaderboard`
 
 ## Human data collection
 

@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   frame_count INTEGER NOT NULL,
   episode_count INTEGER NOT NULL,
   created_at TEXT NOT NULL,
+  score INTEGER NOT NULL DEFAULT 0,
   meta_json TEXT NOT NULL
 );
 

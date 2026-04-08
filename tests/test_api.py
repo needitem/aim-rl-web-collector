@@ -50,7 +50,7 @@ class ApiTest(unittest.TestCase):
                         "source": "unit-test",
                     }
                 ],
-                "meta": {"tag": "smoke"},
+                "meta": {"tag": "smoke", "score": 77},
             }
 
             create_response = client.post("/api/sessions", json=payload)
@@ -58,6 +58,7 @@ class ApiTest(unittest.TestCase):
             metadata = create_response.json()
             self.assertEqual(metadata["source"], "unit-test")
             self.assertEqual(metadata["frame_count"], 1)
+            self.assertEqual(metadata["score"], 77)
 
             list_response = client.get("/api/sessions")
             self.assertEqual(list_response.status_code, 200)
@@ -78,6 +79,12 @@ class ApiTest(unittest.TestCase):
             self.assertEqual(stats["session_count"], 1)
             self.assertEqual(stats["stored_frame_count"], 1)
             self.assertEqual(stats["sources"][0]["source"], "unit-test")
+            self.assertEqual(stats["top_score"], 77)
+            self.assertEqual(stats["leaderboard"][0]["score"], 77)
+
+            leaderboard_response = client.get("/api/leaderboard")
+            self.assertEqual(leaderboard_response.status_code, 200)
+            self.assertEqual(leaderboard_response.json()["leaderboard"][0]["score"], 77)
 
     def test_rate_limit_blocks_excess_uploads(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -112,7 +119,7 @@ class ApiTest(unittest.TestCase):
                         "source": "unit-test",
                     }
                 ],
-                "meta": {},
+                "meta": {"score": 12},
             }
 
             for _ in range(api_main.UPLOAD_LIMIT_PER_MINUTE):

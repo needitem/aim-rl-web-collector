@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict, deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
@@ -58,6 +58,7 @@ class SessionMetadata(BaseModel):
     frame_count: int
     episode_count: int
     created_at: str
+    score: int
     meta: dict[str, Any]
 
 
@@ -68,7 +69,7 @@ class UploadWindow:
 
 UPLOAD_HISTORY: dict[str, UploadWindow] = defaultdict(lambda: UploadWindow(timestamps=deque()))
 
-app = FastAPI(title="Aim RL Collector API", version="0.2.0")
+app = FastAPI(title="Aim RL Collector API", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -95,12 +96,11 @@ def health() -> dict[str, str]:
 def client_ip(request: Request) -> str:
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
-      return forwarded.split(",")[0].strip()
-    client = request.client.host if request.client else "unknown"
-    return client
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 
-def enforce_rate_limit(ip_address: str) -> dict[str, int]:
+def enforce_rate_limit(ip_address: str) -> None:
     now = datetime.now(timezone.utc)
     minute_cutoff = now - timedelta(minutes=1)
     hour_cutoff = now - timedelta(hours=1)
@@ -114,7 +114,6 @@ def enforce_rate_limit(ip_address: str) -> dict[str, int]:
         raise HTTPException(status_code=429, detail=f"Rate limit exceeded: {UPLOAD_LIMIT_PER_MINUTE} uploads per minute")
     if hour_count >= UPLOAD_LIMIT_PER_HOUR:
         raise HTTPException(status_code=429, detail=f"Rate limit exceeded: {UPLOAD_LIMIT_PER_HOUR} uploads per hour")
-    return {"minute": minute_count, "hour": hour_count}
 
 
 def record_upload(ip_address: str) -> None:
@@ -129,6 +128,13 @@ def load_metadata_rows() -> list[dict[str, Any]]:
     return rows
 
 
+def session_score(payload: SessionUpload) -> int:
+    if "score" in payload.meta:
+        return int(payload.meta["score"])
+    rewards = [frame.reward for frame in payload.frames]
+    return max(0, round(sum(rewards)))
+
+
 @app.post("/api/sessions", response_model=SessionMetadata)
 def create_session(payload: SessionUpload, request: Request) -> SessionMetadata:
     ip_address = client_ip(request)
@@ -137,12 +143,14 @@ def create_session(payload: SessionUpload, request: Request) -> SessionMetadata:
     session_id = uuid.uuid4().hex[:12]
     created_at = datetime.now(timezone.utc).isoformat()
     episode_count = len({frame.episode for frame in payload.frames})
+    score = session_score(payload)
     metadata = SessionMetadata(
         session_id=session_id,
         source=payload.source,
         frame_count=len(payload.frames),
         episode_count=episode_count,
         created_at=created_at,
+        score=score,
         meta={**payload.meta, "ip_hash_hint": ip_address[-6:]},
     )
 
@@ -180,15 +188,16 @@ def get_session_jsonl(session_id: str) -> dict[str, str]:
 @app.get("/api/admin/stats")
 def admin_stats(request: Request) -> dict[str, Any]:
     rows = load_metadata_rows()
-    sources = Counter()
-    frames = Counter()
-    total_frames = 0
+    total_frames = sum(int(row.get("frame_count", 0)) for row in rows)
+    scores = [int(row.get("score", 0)) for row in rows]
+
+    source_groups: dict[str, dict[str, int]] = defaultdict(lambda: {"session_count": 0, "frame_count": 0, "score_sum": 0})
     for row in rows:
         source = str(row.get("source", "unknown"))
-        frame_count = int(row.get("frame_count", 0))
-        sources[source] += 1
-        frames[source] += frame_count
-        total_frames += frame_count
+        group = source_groups[source]
+        group["session_count"] += 1
+        group["frame_count"] += int(row.get("frame_count", 0))
+        group["score_sum"] += int(row.get("score", 0))
 
     ip_address = client_ip(request)
     now = datetime.now(timezone.utc)
@@ -198,12 +207,31 @@ def admin_stats(request: Request) -> dict[str, Any]:
     minute_count = sum(1 for stamp in window if stamp >= minute_cutoff)
     hour_count = sum(1 for stamp in window if stamp >= hour_cutoff)
 
+    leaderboard = sorted(rows, key=lambda row: (int(row.get("score", 0)), row.get("created_at", "")), reverse=True)[:10]
     return {
         "session_count": len(rows),
         "stored_frame_count": total_frames,
+        "average_score": round(sum(scores) / len(scores), 2) if scores else 0.0,
+        "top_score": max(scores) if scores else 0,
+        "leaderboard": [
+            {
+                "session_id": row["session_id"],
+                "source": row["source"],
+                "score": int(row.get("score", 0)),
+                "frame_count": int(row.get("frame_count", 0)),
+                "episode_count": int(row.get("episode_count", 0)),
+                "created_at": row["created_at"],
+            }
+            for row in leaderboard
+        ],
         "sources": [
-            {"source": source, "session_count": count, "frame_count": frames[source]}
-            for source, count in sources.most_common()
+            {
+                "source": source,
+                "session_count": values["session_count"],
+                "frame_count": values["frame_count"],
+                "average_score": round(values["score_sum"] / values["session_count"], 2) if values["session_count"] else 0.0,
+            }
+            for source, values in sorted(source_groups.items(), key=lambda item: item[1]["score_sum"], reverse=True)
         ],
         "upload_limits": {
             "minute_limit": UPLOAD_LIMIT_PER_MINUTE,
@@ -211,6 +239,25 @@ def admin_stats(request: Request) -> dict[str, Any]:
             "recent_uploads_from_ip": minute_count,
             "recent_hour_uploads_from_ip": hour_count,
         },
+    }
+
+
+@app.get("/api/leaderboard")
+def leaderboard() -> dict[str, list[dict[str, Any]]]:
+    rows = load_metadata_rows()
+    top_rows = sorted(rows, key=lambda row: (int(row.get("score", 0)), row.get("created_at", "")), reverse=True)[:25]
+    return {
+        "leaderboard": [
+            {
+                "session_id": row["session_id"],
+                "source": row["source"],
+                "score": int(row.get("score", 0)),
+                "frame_count": int(row.get("frame_count", 0)),
+                "episode_count": int(row.get("episode_count", 0)),
+                "created_at": row["created_at"],
+            }
+            for row in top_rows
+        ]
     }
 
 
