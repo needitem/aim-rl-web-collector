@@ -20,10 +20,14 @@ def main() -> None:
     html = HTML_PATH.read_text(encoding="utf-8")
     js = JS_PATH.read_text(encoding="utf-8")
     css = CSS_PATH.read_text(encoding="utf-8")
+    js_asset_path = f"/assets/{JS_PATH.name}"
+    css_asset_path = f"/assets/{CSS_PATH.name}"
 
     worker = f"""const INDEX_HTML = {js_string(html)};
 const APP_JS = {js_string(js)};
 const APP_CSS = {js_string(css)};
+const JS_ASSET_PATH = {js_string(js_asset_path)};
+const CSS_ASSET_PATH = {js_string(css_asset_path)};
 const UPLOAD_LIMIT_PER_MINUTE = 6;
 const UPLOAD_LIMIT_PER_HOUR = 30;
 const WORLD_LIMIT = 1.05;
@@ -144,11 +148,11 @@ export default {{
       return json({{ status: "ok" }});
     }}
 
-    if (url.pathname === "/assets/app.js") {{
+    if (url.pathname === "/assets/app.js" || url.pathname === JS_ASSET_PATH) {{
       return text(APP_JS, "application/javascript; charset=utf-8");
     }}
 
-    if (url.pathname === "/assets/app.css") {{
+    if (url.pathname === "/assets/app.css" || url.pathname === CSS_ASSET_PATH) {{
       return text(APP_CSS, "text/css; charset=utf-8");
     }}
 
@@ -352,8 +356,8 @@ export default {{
 
     return html(
       INDEX_HTML
-        .replace("/assets/index-CbzGeoJP.js", "/assets/app.js")
-        .replace("/assets/index-DuqdNiZL.css", "/assets/app.css")
+        .replace(JS_ASSET_PATH, "/assets/app.js")
+        .replace(CSS_ASSET_PATH, "/assets/app.css")
     );
   }},
 }};
