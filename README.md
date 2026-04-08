@@ -52,6 +52,39 @@ The browser app runs on `http://127.0.0.1:5173` by default and records
 `human-web` sessions. Sessions can be downloaded as JSONL or uploaded to the
 FastAPI backend at `http://127.0.0.1:8000`.
 
+## Cloudflare Deployment
+
+The project is also prepared for a single-service Cloudflare deployment:
+
+- static UI served by a Worker
+- API routes handled by the same Worker
+- session persistence stored in Cloudflare D1
+
+Files:
+
+- `wrangler.jsonc`
+- `cloudflare/schema.sql`
+- `cloudflare/deploy_worker.py`
+
+Deployed URL:
+
+- [aim-rl-web-collector.th07290828.workers.dev](https://aim-rl-web-collector.th07290828.workers.dev)
+
+D1 database:
+
+- name: `aim-rl-web-collector-db`
+
+Local deploy flow:
+
+```bash
+cd web
+npm install
+npm run build
+cd ..
+python cloudflare/deploy_worker.py
+wrangler deploy
+```
+
 ## Human data collection
 
 Interactive collector:

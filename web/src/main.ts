@@ -63,7 +63,7 @@ const REWARD_FORWARD_SCALE = 0.7;
 const ACTION_SMOOTH_PENALTY = 0.12;
 const TIME_PENALTY = 0.01;
 const EPISODE_STEPS = 300;
-const DEFAULT_API = `${window.location.protocol}//${window.location.hostname}:8000`;
+const DEFAULT_API = window.location.origin;
 
 let running = false;
 let episode = 0;
@@ -551,4 +551,3 @@ function round(value: number, digits: number): number {
   const scale = 10 ** digits;
   return Math.round(value * scale) / scale;
 }
-
