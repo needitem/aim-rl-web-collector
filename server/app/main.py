@@ -20,6 +20,12 @@ DATA_DIR = ROOT / "server" / "data" / "sessions"
 WEB_DIST = ROOT / "web" / "dist"
 UPLOAD_LIMIT_PER_MINUTE = 6
 UPLOAD_LIMIT_PER_HOUR = 30
+WORLD_LIMIT = 1.05
+CURSOR_SPEED_LIMIT = 2.0
+TARGET_SPEED_LIMIT = 1.0
+ACTION_LIMIT = 1.05
+TARGET_RADIUS = 0.07
+HIT_RADIUS = 0.03
 
 
 class FramePayload(BaseModel):
@@ -55,6 +61,7 @@ class SessionUpload(BaseModel):
 class SessionMetadata(BaseModel):
     session_id: str
     source: str
+    player_name: str
     frame_count: int
     episode_count: int
     created_at: str
@@ -69,7 +76,7 @@ class UploadWindow:
 
 UPLOAD_HISTORY: dict[str, UploadWindow] = defaultdict(lambda: UploadWindow(timestamps=deque()))
 
-app = FastAPI(title="Aim RL Collector API", version="0.3.0")
+app = FastAPI(title="Aim RL Collector API", version="0.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -100,6 +107,14 @@ def client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+def sanitize_player_name(meta: dict[str, Any]) -> str:
+    raw = str(meta.get("player_name", "anonymous")).strip()
+    filtered = "".join(ch for ch in raw if ch.isalnum() or ch in {" ", "_", "-"}).strip()
+    if not filtered:
+        filtered = "anonymous"
+    return filtered[:24]
+
+
 def enforce_rate_limit(ip_address: str) -> None:
     now = datetime.now(timezone.utc)
     minute_cutoff = now - timedelta(minutes=1)
@@ -120,6 +135,51 @@ def record_upload(ip_address: str) -> None:
     UPLOAD_HISTORY[ip_address].timestamps.append(datetime.now(timezone.utc))
 
 
+def validate_frames(payload: SessionUpload) -> None:
+    last_step_by_episode: dict[int, int] = {}
+    last_time_by_episode: dict[int, float] = {}
+    for frame in payload.frames:
+        if frame.source != payload.source:
+            raise HTTPException(status_code=400, detail="Frame source does not match payload source")
+        if frame.episode < 1 or frame.step < 1:
+            raise HTTPException(status_code=400, detail="Episode and step must be positive")
+        if abs(frame.cursor_x) > WORLD_LIMIT or abs(frame.cursor_y) > WORLD_LIMIT:
+            raise HTTPException(status_code=400, detail="Cursor coordinates are out of bounds")
+        if abs(frame.target_x) > WORLD_LIMIT or abs(frame.target_y) > WORLD_LIMIT:
+            raise HTTPException(status_code=400, detail="Target coordinates are out of bounds")
+        if abs(frame.lead_x) > WORLD_LIMIT or abs(frame.lead_y) > WORLD_LIMIT:
+            raise HTTPException(status_code=400, detail="Lead coordinates are out of bounds")
+        if abs(frame.cursor_vx) > CURSOR_SPEED_LIMIT or abs(frame.cursor_vy) > CURSOR_SPEED_LIMIT:
+            raise HTTPException(status_code=400, detail="Cursor velocity is out of bounds")
+        if abs(frame.target_vx) > TARGET_SPEED_LIMIT or abs(frame.target_vy) > TARGET_SPEED_LIMIT:
+            raise HTTPException(status_code=400, detail="Target velocity is out of bounds")
+        if abs(frame.action_x) > ACTION_LIMIT or abs(frame.action_y) > ACTION_LIMIT:
+            raise HTTPException(status_code=400, detail="Action is out of bounds")
+        if frame.distance < 0 or frame.lead_distance < 0:
+            raise HTTPException(status_code=400, detail="Distances must be non-negative")
+
+        previous_step = last_step_by_episode.get(frame.episode, 0)
+        if frame.step <= previous_step:
+            raise HTTPException(status_code=400, detail="Steps must increase within each episode")
+        previous_time = last_time_by_episode.get(frame.episode, -1.0)
+        if frame.t < previous_time:
+            raise HTTPException(status_code=400, detail="Time must be non-decreasing within each episode")
+        last_step_by_episode[frame.episode] = frame.step
+        last_time_by_episode[frame.episode] = frame.t
+
+
+def compute_score_from_frames(frames: list[FramePayload]) -> int:
+    reward_sum = sum(frame.reward for frame in frames)
+    hit_frames = sum(1 for frame in frames if frame.distance <= HIT_RADIUS)
+    track_frames = sum(1 for frame in frames if frame.distance <= TARGET_RADIUS)
+    min_distance = min(frame.distance for frame in frames)
+    lead_quality = sum(max(0.0, 1.0 - abs(frame.forward_offset - frame.desired_forward_offset)) for frame in frames) / len(frames)
+    return max(
+        0,
+        round(reward_sum + hit_frames * 45 + track_frames * 8 + (1 - min_distance) * 180 + lead_quality * 120),
+    )
+
+
 def load_metadata_rows() -> list[dict[str, Any]]:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
@@ -128,30 +188,26 @@ def load_metadata_rows() -> list[dict[str, Any]]:
     return rows
 
 
-def session_score(payload: SessionUpload) -> int:
-    if "score" in payload.meta:
-        return int(payload.meta["score"])
-    rewards = [frame.reward for frame in payload.frames]
-    return max(0, round(sum(rewards)))
-
-
 @app.post("/api/sessions", response_model=SessionMetadata)
 def create_session(payload: SessionUpload, request: Request) -> SessionMetadata:
     ip_address = client_ip(request)
     enforce_rate_limit(ip_address)
+    validate_frames(payload)
 
     session_id = uuid.uuid4().hex[:12]
     created_at = datetime.now(timezone.utc).isoformat()
     episode_count = len({frame.episode for frame in payload.frames})
-    score = session_score(payload)
+    player_name = sanitize_player_name(payload.meta)
+    score = compute_score_from_frames(payload.frames)
     metadata = SessionMetadata(
         session_id=session_id,
         source=payload.source,
+        player_name=player_name,
         frame_count=len(payload.frames),
         episode_count=episode_count,
         created_at=created_at,
         score=score,
-        meta={**payload.meta, "ip_hash_hint": ip_address[-6:]},
+        meta={**payload.meta, "player_name": player_name, "ip_hash_hint": ip_address[-6:]},
     )
 
     jsonl_path = DATA_DIR / f"{session_id}.jsonl"
@@ -207,7 +263,7 @@ def admin_stats(request: Request) -> dict[str, Any]:
     minute_count = sum(1 for stamp in window if stamp >= minute_cutoff)
     hour_count = sum(1 for stamp in window if stamp >= hour_cutoff)
 
-    leaderboard = sorted(rows, key=lambda row: (int(row.get("score", 0)), row.get("created_at", "")), reverse=True)[:10]
+    leaderboard_rows = sorted(rows, key=lambda row: (int(row.get("score", 0)), row.get("created_at", "")), reverse=True)[:10]
     return {
         "session_count": len(rows),
         "stored_frame_count": total_frames,
@@ -217,12 +273,13 @@ def admin_stats(request: Request) -> dict[str, Any]:
             {
                 "session_id": row["session_id"],
                 "source": row["source"],
+                "player_name": row.get("player_name", row.get("meta", {}).get("player_name", "anonymous")),
                 "score": int(row.get("score", 0)),
                 "frame_count": int(row.get("frame_count", 0)),
                 "episode_count": int(row.get("episode_count", 0)),
                 "created_at": row["created_at"],
             }
-            for row in leaderboard
+            for row in leaderboard_rows
         ],
         "sources": [
             {
@@ -251,6 +308,7 @@ def leaderboard() -> dict[str, list[dict[str, Any]]]:
             {
                 "session_id": row["session_id"],
                 "source": row["source"],
+                "player_name": row.get("player_name", row.get("meta", {}).get("player_name", "anonymous")),
                 "score": int(row.get("score", 0)),
                 "frame_count": int(row.get("frame_count", 0)),
                 "episode_count": int(row.get("episode_count", 0)),

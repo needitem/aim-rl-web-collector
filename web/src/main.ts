@@ -27,6 +27,7 @@ type Frame = {
 type SessionSummary = {
   session_id: string;
   source: string;
+  player_name?: string;
   frame_count: number;
   episode_count: number;
   created_at: string;
@@ -37,6 +38,7 @@ type SessionSummary = {
 type LeaderboardEntry = {
   session_id: string;
   source: string;
+  player_name?: string;
   score: number;
   frame_count: number;
   episode_count: number;
@@ -107,6 +109,7 @@ let statusMessage = "Ready";
 let rngSeed = 17;
 let adminStats: AdminStats | null = null;
 let state = resetState();
+let playerName = window.localStorage.getItem("aim-rl-player-name") || "anonymous";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 if (!app) throw new Error("App root not found.");
@@ -132,6 +135,10 @@ app.innerHTML = `
     </div>
 
     <div class="api-box">
+      <label>
+        Player Name
+        <input id="player-name" value="${playerName}" maxlength="24" />
+      </label>
       <label>
         API Base URL
         <input id="api-base" value="${DEFAULT_API}" />
@@ -211,6 +218,7 @@ const canvas = getRequired<HTMLCanvasElement>("#arena");
 const ctx = get2d(canvas);
 const replayCanvas = getRequired<HTMLCanvasElement>("#replay-canvas");
 const replayCtx = get2d(replayCanvas);
+const playerNameInput = getRequired<HTMLInputElement>("#player-name");
 const apiInput = getRequired<HTMLInputElement>("#api-base");
 const toggleRunButton = getRequired<HTMLButtonElement>("#toggle-run");
 const resetButton = getRequired<HTMLButtonElement>("#reset-episode");
@@ -267,6 +275,11 @@ replaySlider.addEventListener("input", () => {
   replayIndex = Number(replaySlider.value);
   replayPlaying = false;
   syncReplayControls();
+});
+playerNameInput.addEventListener("input", () => {
+  playerName = sanitizePlayerName(playerNameInput.value);
+  playerNameInput.value = playerName;
+  window.localStorage.setItem("aim-rl-player-name", playerName);
 });
 
 pointerX = state.cursorX;
@@ -541,6 +554,7 @@ function sessionPayload(): { source: string; frames: Frame[]; meta: Record<strin
       client: "aim-rl-web",
       created_at: new Date().toISOString(),
       score: computeScore(frames),
+      player_name: playerName,
       best_distance: frames.length ? Math.min(...frames.map((frame) => frame.distance)) : 0,
       hit_frames: frames.filter((frame) => frame.distance <= HIT_RADIUS).length,
       track_frames: frames.filter((frame) => frame.distance <= TARGET_RADIUS).length,
@@ -661,7 +675,7 @@ function renderLeaderboard(): void {
     .slice(0, 10)
     .map(
       (entry, index) =>
-        `<li><button class="leaderboard-button" data-session-id="${entry.session_id}"><strong>#${index + 1} ${entry.score}</strong><span>${entry.source} · ${entry.frame_count} frames</span></button></li>`,
+        `<li><button class="leaderboard-button" data-session-id="${entry.session_id}"><strong>#${index + 1} ${entry.score} · ${entry.player_name ?? "anonymous"}</strong><span>${entry.source} · ${entry.frame_count} frames</span></button></li>`,
     )
     .join("");
   document.querySelectorAll<HTMLButtonElement>(".leaderboard-button").forEach((button) => {
@@ -678,7 +692,7 @@ function renderSessions(): void {
         <li class="session-item${selected}">
           <button class="session-button" data-session-id="${summary.session_id}">
             <strong>${summary.session_id}</strong>
-            <span>${summary.source} · ${summary.score ?? 0} pts · ${summary.frame_count} frames</span>
+            <span>${summary.player_name ?? "anonymous"} · ${summary.score ?? 0} pts · ${summary.frame_count} frames</span>
           </button>
         </li>
       `;
@@ -799,6 +813,15 @@ function round(value: number, digits: number): number {
 
 function stamp(): string {
   return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+function sanitizePlayerName(value: string): string {
+  const cleaned = value
+    .split("")
+    .filter((char) => /[a-zA-Z0-9 _-]/.test(char))
+    .join("")
+    .trim();
+  return (cleaned || "anonymous").slice(0, 24);
 }
 
 function lastFrame(): Frame | undefined {

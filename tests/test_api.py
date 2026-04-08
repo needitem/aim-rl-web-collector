@@ -50,7 +50,7 @@ class ApiTest(unittest.TestCase):
                         "source": "unit-test",
                     }
                 ],
-                "meta": {"tag": "smoke", "score": 77},
+                "meta": {"tag": "smoke", "score": 77, "player_name": "Need Item"},
             }
 
             create_response = client.post("/api/sessions", json=payload)
@@ -58,7 +58,8 @@ class ApiTest(unittest.TestCase):
             metadata = create_response.json()
             self.assertEqual(metadata["source"], "unit-test")
             self.assertEqual(metadata["frame_count"], 1)
-            self.assertEqual(metadata["score"], 77)
+            self.assertEqual(metadata["score"], 246)
+            self.assertEqual(metadata["player_name"], "Need Item")
 
             list_response = client.get("/api/sessions")
             self.assertEqual(list_response.status_code, 200)
@@ -79,12 +80,13 @@ class ApiTest(unittest.TestCase):
             self.assertEqual(stats["session_count"], 1)
             self.assertEqual(stats["stored_frame_count"], 1)
             self.assertEqual(stats["sources"][0]["source"], "unit-test")
-            self.assertEqual(stats["top_score"], 77)
-            self.assertEqual(stats["leaderboard"][0]["score"], 77)
+            self.assertEqual(stats["top_score"], 246)
+            self.assertEqual(stats["leaderboard"][0]["score"], 246)
+            self.assertEqual(stats["leaderboard"][0]["player_name"], "Need Item")
 
             leaderboard_response = client.get("/api/leaderboard")
             self.assertEqual(leaderboard_response.status_code, 200)
-            self.assertEqual(leaderboard_response.json()["leaderboard"][0]["score"], 77)
+            self.assertEqual(leaderboard_response.json()["leaderboard"][0]["score"], 246)
 
     def test_rate_limit_blocks_excess_uploads(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -119,7 +121,7 @@ class ApiTest(unittest.TestCase):
                         "source": "unit-test",
                     }
                 ],
-                "meta": {"score": 12},
+                "meta": {"score": 12, "player_name": "Rate Tester"},
             }
 
             for _ in range(api_main.UPLOAD_LIMIT_PER_MINUTE):
@@ -128,6 +130,44 @@ class ApiTest(unittest.TestCase):
 
             blocked = client.post("/api/sessions", json=payload)
             self.assertEqual(blocked.status_code, 429)
+
+    def test_invalid_frame_payload_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api_main.DATA_DIR = Path(temp_dir)
+            api_main.ensure_storage()
+            api_main.UPLOAD_HISTORY.clear()
+            client = TestClient(api_main.app)
+            payload = {
+                "source": "unit-test",
+                "frames": [
+                    {
+                        "episode": 1,
+                        "step": 1,
+                        "t": 0.0167,
+                        "cursor_x": 999.0,
+                        "cursor_y": 0.0,
+                        "cursor_vx": 0.0,
+                        "cursor_vy": 0.0,
+                        "target_x": 0.1,
+                        "target_y": -0.1,
+                        "target_vx": 0.01,
+                        "target_vy": 0.02,
+                        "lead_x": 0.11,
+                        "lead_y": -0.08,
+                        "action_x": 0.2,
+                        "action_y": -0.1,
+                        "distance": 0.3,
+                        "lead_distance": 0.2,
+                        "forward_offset": 0.05,
+                        "desired_forward_offset": 0.04,
+                        "reward": 1.2,
+                        "source": "unit-test",
+                    }
+                ],
+                "meta": {"player_name": "Cheater"},
+            }
+            response = client.post("/api/sessions", json=payload)
+            self.assertEqual(response.status_code, 400)
 
 
 if __name__ == "__main__":

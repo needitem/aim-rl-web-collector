@@ -57,6 +57,7 @@ The browser UI now includes:
 - live collection arena
 - live session score
 - leaderboard
+- player nickname
 - admin stats snapshot
 - stored session browser
 - replay viewer with play/pause, scrub, and JSONL download
@@ -100,6 +101,8 @@ Public upload safeguards in the deployed worker:
 - session metadata plus raw trace stored in D1
 - admin stats endpoint: `/api/admin/stats`
 - leaderboard endpoint: `/api/leaderboard`
+- server-side score recomputation
+- basic payload validation for bounds and monotonic frame order
 
 ## Human data collection
 

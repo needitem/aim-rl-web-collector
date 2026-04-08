@@ -1,6 +1,7 @@
 CREATE TABLE IF NOT EXISTS sessions (
   session_id TEXT PRIMARY KEY,
   source TEXT NOT NULL,
+  player_name TEXT NOT NULL DEFAULT 'anonymous',
   frame_count INTEGER NOT NULL,
   episode_count INTEGER NOT NULL,
   created_at TEXT NOT NULL,

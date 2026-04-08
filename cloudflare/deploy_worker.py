@@ -26,6 +26,12 @@ const APP_JS = {js_string(js)};
 const APP_CSS = {js_string(css)};
 const UPLOAD_LIMIT_PER_MINUTE = 6;
 const UPLOAD_LIMIT_PER_HOUR = 30;
+const WORLD_LIMIT = 1.05;
+const CURSOR_SPEED_LIMIT = 2.0;
+const TARGET_SPEED_LIMIT = 1.0;
+const ACTION_LIMIT = 1.05;
+const TARGET_RADIUS = 0.07;
+const HIT_RADIUS = 0.03;
 
 function json(data, init = {{}}) {{
   return new Response(JSON.stringify(data), {{
@@ -71,18 +77,52 @@ function clientIp(request) {{
   return request.headers.get("CF-Connecting-IP") || "unknown";
 }}
 
+function sanitizePlayerName(meta) {{
+  const raw = String(meta?.player_name || "anonymous").trim();
+  const filtered = raw.split("").filter((char) => /[a-zA-Z0-9 _-]/.test(char)).join("").trim();
+  return (filtered || "anonymous").slice(0, 24);
+}}
+
+function validateFrames(payload) {{
+  const lastStepByEpisode = new Map();
+  const lastTimeByEpisode = new Map();
+  for (const frame of payload.frames) {{
+    if (frame.source !== payload.source) return "Frame source does not match payload source";
+    if (frame.episode < 1 || frame.step < 1) return "Episode and step must be positive";
+    if (Math.abs(frame.cursor_x) > WORLD_LIMIT || Math.abs(frame.cursor_y) > WORLD_LIMIT) return "Cursor coordinates are out of bounds";
+    if (Math.abs(frame.target_x) > WORLD_LIMIT || Math.abs(frame.target_y) > WORLD_LIMIT) return "Target coordinates are out of bounds";
+    if (Math.abs(frame.lead_x) > WORLD_LIMIT || Math.abs(frame.lead_y) > WORLD_LIMIT) return "Lead coordinates are out of bounds";
+    if (Math.abs(frame.cursor_vx) > CURSOR_SPEED_LIMIT || Math.abs(frame.cursor_vy) > CURSOR_SPEED_LIMIT) return "Cursor velocity is out of bounds";
+    if (Math.abs(frame.target_vx) > TARGET_SPEED_LIMIT || Math.abs(frame.target_vy) > TARGET_SPEED_LIMIT) return "Target velocity is out of bounds";
+    if (Math.abs(frame.action_x) > ACTION_LIMIT || Math.abs(frame.action_y) > ACTION_LIMIT) return "Action is out of bounds";
+    if (frame.distance < 0 || frame.lead_distance < 0) return "Distances must be non-negative";
+
+    const previousStep = lastStepByEpisode.get(frame.episode) || 0;
+    const previousTime = lastTimeByEpisode.get(frame.episode) || -1;
+    if (frame.step <= previousStep) return "Steps must increase within each episode";
+    if (frame.t < previousTime) return "Time must be non-decreasing within each episode";
+    lastStepByEpisode.set(frame.episode, frame.step);
+    lastTimeByEpisode.set(frame.episode, frame.t);
+  }}
+  return null;
+}}
+
+function computeScore(frames) {{
+  const rewardSum = frames.reduce((sum, frame) => sum + Number(frame.reward || 0), 0);
+  const hitFrames = frames.filter((frame) => Number(frame.distance) <= HIT_RADIUS).length;
+  const trackFrames = frames.filter((frame) => Number(frame.distance) <= TARGET_RADIUS).length;
+  const minDistance = Math.min(...frames.map((frame) => Number(frame.distance)));
+  const leadQuality = frames.reduce((sum, frame) => {{
+    return sum + Math.max(0, 1 - Math.abs(Number(frame.forward_offset) - Number(frame.desired_forward_offset)));
+  }}, 0) / frames.length;
+  return Math.max(0, Math.round(rewardSum + hitFrames * 45 + trackFrames * 8 + (1 - minDistance) * 180 + leadQuality * 120));
+}}
+
 async function countUploads(env, ipAddress, sinceIso) {{
   const result = await env.DB.prepare(
     `SELECT COUNT(*) AS count FROM upload_events WHERE ip_address = ?1 AND created_at >= ?2`
   ).bind(ipAddress, sinceIso).first();
   return Number(result?.count || 0);
-}}
-
-function sessionScore(payload) {{
-  if (payload.meta && payload.meta.score !== undefined) {{
-    return Number(payload.meta.score || 0);
-  }}
-  return Math.max(0, Math.round((payload.frames || []).reduce((sum, frame) => sum + Number(frame.reward || 0), 0)));
 }}
 
 export default {{
@@ -118,6 +158,11 @@ export default {{
         return json({{ error: "Invalid payload" }}, {{ status: 400 }});
       }}
 
+      const validationError = validateFrames(payload);
+      if (validationError) {{
+        return json({{ error: validationError }}, {{ status: 400 }});
+      }}
+
       const now = new Date();
       const minuteAgo = new Date(now.getTime() - 60 * 1000).toISOString();
       const hourAgo = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
@@ -133,16 +178,18 @@ export default {{
       const sessionId = crypto.randomUUID().replaceAll("-", "").slice(0, 12);
       const createdAt = now.toISOString();
       const episodeCount = new Set(payload.frames.map((frame) => frame.episode)).size;
-      const score = sessionScore(payload);
-      const metaJson = JSON.stringify({{ ...(payload.meta || {{}}), ip_hash_hint: ipAddress.slice(-6) }});
+      const score = computeScore(payload.frames);
+      const playerName = sanitizePlayerName(payload.meta);
+      const metaJson = JSON.stringify({{ ...(payload.meta || {{}}), player_name: playerName, ip_hash_hint: ipAddress.slice(-6) }});
       const jsonl = sessionJsonl(payload.frames);
 
       await env.DB.prepare(
-        `INSERT INTO sessions (session_id, source, frame_count, episode_count, created_at, score, meta_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`
+        `INSERT INTO sessions (session_id, source, player_name, frame_count, episode_count, created_at, score, meta_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`
       ).bind(
         sessionId,
         payload.source || "unknown",
+        playerName,
         payload.frames.length,
         episodeCount,
         createdAt,
@@ -161,11 +208,12 @@ export default {{
       return json({{
         session_id: sessionId,
         source: payload.source || "unknown",
+        player_name: playerName,
         frame_count: payload.frames.length,
         episode_count: episodeCount,
         created_at: createdAt,
         score,
-        meta: payload.meta || {{}},
+        meta: {{ ...(payload.meta || {{}}), player_name: playerName }},
       }}, {{
         headers: {{ "access-control-allow-origin": "*" }},
       }});
@@ -182,7 +230,7 @@ export default {{
          FROM sessions`
       ).first();
       const leaderboardResult = await env.DB.prepare(
-        `SELECT session_id, source, score, frame_count, episode_count, created_at
+        `SELECT session_id, source, player_name, score, frame_count, episode_count, created_at
          FROM sessions ORDER BY score DESC, created_at DESC LIMIT 10`
       ).all();
       const now = new Date();
@@ -198,6 +246,7 @@ export default {{
         leaderboard: (leaderboardResult.results || []).map((row) => ({{
           session_id: row.session_id,
           source: row.source,
+          player_name: row.player_name || "anonymous",
           score: Number(row.score || 0),
           frame_count: Number(row.frame_count || 0),
           episode_count: Number(row.episode_count || 0),
@@ -222,15 +271,15 @@ export default {{
 
     if (url.pathname === "/api/sessions" && request.method === "GET") {{
       const result = await env.DB.prepare(
-        `SELECT session_id, source, frame_count, episode_count, created_at, score, meta_json
+        `SELECT session_id, source, player_name, frame_count, episode_count, created_at, score, meta_json
          FROM sessions ORDER BY created_at DESC LIMIT 50`
       ).all();
-
       const sessions = (result.results || []).map((row) => ({{
         session_id: row.session_id,
         source: row.source,
-        frame_count: row.frame_count,
-        episode_count: row.episode_count,
+        player_name: row.player_name || "anonymous",
+        frame_count: Number(row.frame_count || 0),
+        episode_count: Number(row.episode_count || 0),
         created_at: row.created_at,
         score: Number(row.score || 0),
         meta: JSON.parse(row.meta_json || "{{}}"),
@@ -242,13 +291,14 @@ export default {{
 
     if (url.pathname === "/api/leaderboard" && request.method === "GET") {{
       const result = await env.DB.prepare(
-        `SELECT session_id, source, score, frame_count, episode_count, created_at
+        `SELECT session_id, source, player_name, score, frame_count, episode_count, created_at
          FROM sessions ORDER BY score DESC, created_at DESC LIMIT 25`
       ).all();
       return json({{
         leaderboard: (result.results || []).map((row) => ({{
           session_id: row.session_id,
           source: row.source,
+          player_name: row.player_name || "anonymous",
           score: Number(row.score || 0),
           frame_count: Number(row.frame_count || 0),
           episode_count: Number(row.episode_count || 0),
@@ -279,7 +329,7 @@ export default {{
       }}
 
       const row = await env.DB.prepare(
-        `SELECT session_id, source, frame_count, episode_count, created_at, score, meta_json
+        `SELECT session_id, source, player_name, frame_count, episode_count, created_at, score, meta_json
          FROM sessions WHERE session_id = ?1`
       ).bind(sessionId).first();
       if (!row) {{
@@ -289,8 +339,9 @@ export default {{
       return json({{
         session_id: row.session_id,
         source: row.source,
-        frame_count: row.frame_count,
-        episode_count: row.episode_count,
+        player_name: row.player_name || "anonymous",
+        frame_count: Number(row.frame_count || 0),
+        episode_count: Number(row.episode_count || 0),
         created_at: row.created_at,
         score: Number(row.score || 0),
         meta: JSON.parse(row.meta_json || "{{}}"),
