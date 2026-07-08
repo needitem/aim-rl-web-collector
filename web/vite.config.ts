@@ -1,16 +1,12 @@
 import { defineConfig } from "vite";
 
+// Static build for GitHub Pages (no backend). `base` is the project-page path
+// (https://<user>.github.io/aim-rl-web-collector/); change it for a user page
+// or custom domain.
 export default defineConfig({
-  server: {
-    port: 5173,
-    proxy: {
-      "/api": "http://127.0.0.1:8000",
-      "/health": "http://127.0.0.1:8000",
-    },
-  },
+  base: "/aim-rl-web-collector/",
   build: {
     outDir: "dist",
     emptyOutDir: true,
   },
 });
-

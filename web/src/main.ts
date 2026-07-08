@@ -4,6 +4,7 @@ type Frame = {
   episode: number;
   step: number;
   t: number;
+  wall_t: number;        // performance.now() ms - real wall-clock timing (L2 reaction, L6 challenge)
   cursor_x: number;
   cursor_y: number;
   cursor_vx: number;
@@ -21,7 +22,37 @@ type Frame = {
   forward_offset: number;
   desired_forward_offset: number;
   reward: number;
+  client_x: number;      // raw viewport pixel cursor (true kinematics / visual-angle reconstruction)
+  client_y: number;
+  perturbed: number;     // 1 on the frame the target discretely jumped (stimulus onset), else 0
   source: string;
+};
+
+// Discrete behavioral events, timestamped on the same wall clock as frames.
+// Enables L2 (reaction time = target_jump -> pointer/velocity response), L5
+// (cross-modal keyboard+mouse), and clean L6 challenge markers.
+type GameEvent = {
+  type: "pointerdown" | "pointerup" | "keydown" | "keyup" | "target_jump";
+  wall_t: number;
+  episode: number;
+  step: number;
+  x?: number;            // world coords: pointer position, or target position for a jump
+  y?: number;
+  client_x?: number;     // raw pixel (pointer events)
+  client_y?: number;
+  key?: string;          // keyboard events
+  button?: number;       // pointer button
+};
+
+// High-resolution mouse sample captured at the pointer's NATIVE rate (240Hz+ on
+// gaming mice) via getCoalescedEvents, independent of the 60Hz sim - so the L1
+// micro-structure (jerk/tremor) that the sim down-sampling would destroy is kept.
+type MouseSample = {
+  wall_t: number;        // event.timeStamp (performance.now() clock), ms
+  x: number;             // world coords
+  y: number;
+  client_x: number;      // raw pixel
+  client_y: number;
 };
 
 type SessionSummary = {
@@ -73,6 +104,7 @@ type WorldState = {
   prevActionX: number;
   prevActionY: number;
   consecutiveHits: number;
+  nextPerturbStep: number;   // step at which the target will discretely jump (L2/L6 stimulus)
 };
 
 type SessionStats = {
@@ -100,28 +132,27 @@ const REWARD_FORWARD_SCALE = 0.7;
 const ACTION_SMOOTH_PENALTY = 0.12;
 const TIME_PENALTY = 0.01;
 const EPISODE_STEPS = 300;
-const DEFAULT_API = window.location.origin;
+// Discrete target perturbation: the target teleports + re-aims at a random step,
+// giving a clean stimulus onset to measure reaction time (L2) and evoked
+// tracking recovery (L6) - the continuous random walk alone has no such event.
+const PERTURB_MIN_GAP = 45;   // steps (~0.75 s) minimum before a jump can fire
+const PERTURB_MAX_GAP = 150;  // steps (~2.5 s) maximum
 
 let running = false;
 let episode = 0;
 let frames: Frame[] = [];
-let summaries: SessionSummary[] = [];
-let selectedSessionId: string | null = null;
-let replayFrames: Frame[] = [];
-let replayIndex = 0;
-let replayPlaying = false;
 let pointerX = 0;
 let pointerY = 0;
+let rawClientX = 0;
+let rawClientY = 0;
+let sessionEvents: GameEvent[] = [];
+let mouseTrace: MouseSample[] = [];
 let lastTimestamp = 0;
-let replayTimestamp = 0;
 let statusMessage = "Ready";
 let rngSeed = 17;
-let adminStats: AdminStats | null = null;
 let state = resetState();
 let playerName = window.localStorage.getItem("aim-rl-player-name") || "anonymous";
 let sessionStats = createEmptySessionStats();
-let leaderboardRenderKey = "";
-let sessionListRenderKey = "";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 if (!app) throw new Error("App root not found.");
@@ -132,8 +163,9 @@ app.innerHTML = `
       <p class="eyebrow">Browser Collector</p>
       <h1>Aim RL Web Arena</h1>
       <p class="lede">
-        Collect human aim traces, compete on score, upload sessions, and replay top runs
-        without leaving the browser.
+        Track the moving target. The target jumps at random intervals — chase it.
+        When you're done, <strong>Download JSONL</strong> and send the file. Mouse is
+        captured at your device's native rate (240Hz+ on gaming mice).
       </p>
     </div>
 
@@ -141,8 +173,7 @@ app.innerHTML = `
       <div class="button-row">
         <button id="toggle-run">Start</button>
         <button id="reset-episode" class="secondary">Reset Episode</button>
-        <button id="save-local" class="ghost">Download JSONL</button>
-        <button id="upload-session" class="secondary">Upload Session</button>
+        <button id="save-local" class="secondary">Download JSONL</button>
       </div>
     </div>
 
@@ -151,14 +182,6 @@ app.innerHTML = `
         Player Name
         <input id="player-name" value="${playerName}" maxlength="24" />
       </label>
-      <label>
-        API Base URL
-        <input id="api-base" value="${DEFAULT_API}" />
-      </label>
-      <div class="button-row">
-        <button id="refresh-admin" class="ghost">Refresh Admin</button>
-        <button id="clear-replay" class="ghost">Clear Replay</button>
-      </div>
     </div>
 
     <div class="metrics">
@@ -172,21 +195,6 @@ app.innerHTML = `
       </div>
     </div>
 
-    <div class="admin-block">
-      <strong>Admin Snapshot</strong>
-      <div id="admin-stats" class="admin-stats"></div>
-    </div>
-
-    <div class="leaderboard-block">
-      <strong>Leaderboard</strong>
-      <ol id="leaderboard-list" class="leaderboard-list"></ol>
-    </div>
-
-    <div class="sessions">
-      <strong>Stored Sessions</strong>
-      <ul id="session-list" class="session-list"></ul>
-    </div>
-
     <p id="status-line" class="footer-note">Ready</p>
   </section>
 
@@ -195,32 +203,7 @@ app.innerHTML = `
       <canvas id="arena" width="960" height="960"></canvas>
       <div class="canvas-overlay">
         <div class="badge">Orange = track zone, violet = hit zone, green = lead point</div>
-        <div class="hint">Space start/pause, R reset, U upload, P replay</div>
-      </div>
-    </div>
-  </section>
-
-  <section class="panel replay-panel">
-    <div class="replay-header">
-      <div>
-        <p class="eyebrow">Replay Viewer</p>
-        <h2 id="replay-title">No Session Loaded</h2>
-      </div>
-      <div class="button-row">
-        <button id="replay-toggle" class="secondary" disabled>Play</button>
-        <button id="replay-download" class="ghost" disabled>Download Trace</button>
-      </div>
-    </div>
-
-    <div class="replay-shell">
-      <canvas id="replay-canvas" width="720" height="720"></canvas>
-    </div>
-
-    <div class="replay-controls">
-      <input id="replay-slider" type="range" min="0" max="0" value="0" disabled />
-      <div class="replay-meta">
-        <span id="replay-step">step 0 / 0</span>
-        <span id="replay-distance">distance 0.000</span>
+        <div class="hint">Space start/pause, R reset, D download</div>
       </div>
     </div>
   </section>
@@ -228,19 +211,10 @@ app.innerHTML = `
 
 const canvas = getRequired<HTMLCanvasElement>("#arena");
 const ctx = get2d(canvas);
-const replayCanvas = getRequired<HTMLCanvasElement>("#replay-canvas");
-const replayCtx = get2d(replayCanvas);
 const playerNameInput = getRequired<HTMLInputElement>("#player-name");
-const apiInput = getRequired<HTMLInputElement>("#api-base");
 const toggleRunButton = getRequired<HTMLButtonElement>("#toggle-run");
 const resetButton = getRequired<HTMLButtonElement>("#reset-episode");
 const saveButton = getRequired<HTMLButtonElement>("#save-local");
-const uploadButton = getRequired<HTMLButtonElement>("#upload-session");
-const refreshButton = getRequired<HTMLButtonElement>("#refresh-admin");
-const clearReplayButton = getRequired<HTMLButtonElement>("#clear-replay");
-const replayToggleButton = getRequired<HTMLButtonElement>("#replay-toggle");
-const replayDownloadButton = getRequired<HTMLButtonElement>("#replay-download");
-const replaySlider = getRequired<HTMLInputElement>("#replay-slider");
 const modeEl = getRequired<HTMLElement>("#metric-mode");
 const episodeEl = getRequired<HTMLElement>("#metric-episode");
 const framesEl = getRequired<HTMLElement>("#metric-frames");
@@ -248,60 +222,68 @@ const distanceEl = getRequired<HTMLElement>("#metric-distance");
 const forwardEl = getRequired<HTMLElement>("#metric-forward");
 const scoreEl = getRequired<HTMLElement>("#metric-score");
 const statusEl = getRequired<HTMLElement>("#status-line");
-const adminStatsEl = getRequired<HTMLElement>("#admin-stats");
-const leaderboardEl = getRequired<HTMLElement>("#leaderboard-list");
-const sessionListEl = getRequired<HTMLElement>("#session-list");
-const replayTitleEl = getRequired<HTMLElement>("#replay-title");
-const replayStepEl = getRequired<HTMLElement>("#replay-step");
-const replayDistanceEl = getRequired<HTMLElement>("#replay-distance");
 
-canvas.addEventListener("mousemove", (event) => {
+canvas.addEventListener("pointermove", (event) => {
   const rect = canvas.getBoundingClientRect();
+  rawClientX = event.clientX;
+  rawClientY = event.clientY;
   pointerX = clip((((event.clientX - rect.left) / rect.width) * 2 - 1) * WORLD_X, -WORLD_X, WORLD_X);
   pointerY = clip((1 - ((event.clientY - rect.top) / rect.height) * 2) * WORLD_Y, -WORLD_Y, WORLD_Y);
+  if (!running) return;
+  // High-resolution capture at the mouse's NATIVE rate (240Hz+ on gaming mice):
+  // getCoalescedEvents returns every raw sample the browser batched into this
+  // event, each with its own event.timeStamp - the 60Hz sim would discard them.
+  const batch = event.getCoalescedEvents ? event.getCoalescedEvents() : [event];
+  for (const e of batch) {
+    const wx = clip((((e.clientX - rect.left) / rect.width) * 2 - 1) * WORLD_X, -WORLD_X, WORLD_X);
+    const wy = clip((1 - ((e.clientY - rect.top) / rect.height) * 2) * WORLD_Y, -WORLD_Y, WORLD_Y);
+    mouseTrace.push({
+      wall_t: round(e.timeStamp, 3), x: round(wx, 6), y: round(wy, 6),
+      client_x: e.clientX, client_y: e.clientY,
+    });
+  }
 });
 
+// Pointer-button events: reaction-response markers (L2) and cross-modal (L5).
+canvas.addEventListener("pointerdown", (event) => logPointerEvent("pointerdown", event));
+canvas.addEventListener("pointerup", (event) => logPointerEvent("pointerup", event));
+
 window.addEventListener("keydown", (event) => {
+  if (running && !event.repeat) logKeyEvent("keydown", event);
   const key = event.key.toLowerCase();
   if (event.code === "Space") {
     event.preventDefault();
     toggleRun();
   } else if (key === "r") {
     resetEpisode();
-  } else if (key === "u") {
-    void uploadSession();
-  } else if (key === "p" && replayFrames.length > 0) {
-    toggleReplay();
+  } else if (key === "d") {
+    downloadSession();
   }
 });
+window.addEventListener("keyup", (event) => {
+  if (running) logKeyEvent("keyup", event);
+});
+
+function logPointerEvent(type: "pointerdown" | "pointerup", event: PointerEvent): void {
+  if (!running) return;
+  const rect = canvas.getBoundingClientRect();
+  const wx = clip((((event.clientX - rect.left) / rect.width) * 2 - 1) * WORLD_X, -WORLD_X, WORLD_X);
+  const wy = clip((1 - ((event.clientY - rect.top) / rect.height) * 2) * WORLD_Y, -WORLD_Y, WORLD_Y);
+  sessionEvents.push({
+    type, wall_t: round(performance.now(), 3), episode: episode + 1, step: state.stepCount,
+    x: round(wx, 6), y: round(wy, 6), client_x: event.clientX, client_y: event.clientY, button: event.button,
+  });
+}
+
+function logKeyEvent(type: "keydown" | "keyup", event: KeyboardEvent): void {
+  sessionEvents.push({
+    type, wall_t: round(performance.now(), 3), episode: episode + 1, step: state.stepCount, key: event.key,
+  });
+}
 
 toggleRunButton.addEventListener("click", () => toggleRun());
 resetButton.addEventListener("click", () => resetEpisode());
 saveButton.addEventListener("click", () => downloadSession());
-uploadButton.addEventListener("click", () => void uploadSession());
-refreshButton.addEventListener("click", () => void refreshAdmin());
-clearReplayButton.addEventListener("click", () => clearReplay());
-replayToggleButton.addEventListener("click", () => toggleReplay());
-replayDownloadButton.addEventListener("click", () => void downloadReplayTrace());
-replaySlider.addEventListener("input", () => {
-  replayIndex = Number(replaySlider.value);
-  replayPlaying = false;
-  syncReplayControls();
-});
-leaderboardEl.addEventListener("click", (event) => {
-  const target = event.target as HTMLElement | null;
-  const button = target?.closest<HTMLButtonElement>(".leaderboard-button");
-  if (button?.dataset.sessionId) {
-    void loadReplay(button.dataset.sessionId);
-  }
-});
-sessionListEl.addEventListener("click", (event) => {
-  const target = event.target as HTMLElement | null;
-  const button = target?.closest<HTMLButtonElement>(".session-button");
-  if (button?.dataset.sessionId) {
-    void loadReplay(button.dataset.sessionId);
-  }
-});
 playerNameInput.addEventListener("input", () => {
   playerName = sanitizePlayerName(playerNameInput.value);
   playerNameInput.value = playerName;
@@ -311,13 +293,10 @@ playerNameInput.addEventListener("input", () => {
 pointerX = state.cursorX;
 pointerY = state.cursorY;
 renderLive();
-renderReplay();
-void refreshAdmin();
 requestAnimationFrame(loop);
 
 function loop(timestamp: number): void {
   if (lastTimestamp === 0) lastTimestamp = timestamp;
-  if (replayTimestamp === 0) replayTimestamp = timestamp;
 
   if (running && timestamp - lastTimestamp >= DT * 1000) {
     const steps = Math.max(1, Math.floor((timestamp - lastTimestamp) / (DT * 1000)));
@@ -325,15 +304,7 @@ function loop(timestamp: number): void {
     lastTimestamp = timestamp;
   }
 
-  if (replayPlaying && replayFrames.length > 0 && timestamp - replayTimestamp >= DT * 1000) {
-    replayIndex = Math.min(replayIndex + 1, replayFrames.length - 1);
-    if (replayIndex >= replayFrames.length - 1) replayPlaying = false;
-    replayTimestamp = timestamp;
-    syncReplayControls();
-  }
-
   renderLive();
-  renderReplay();
   requestAnimationFrame(loop);
 }
 
@@ -366,6 +337,25 @@ function tick(): void {
 
   const impliedAx = clip(state.cursorVx - previousCursorVx, -MAX_ACTION, MAX_ACTION);
   const impliedAy = clip(state.cursorVy - previousCursorVy, -MAX_ACTION, MAX_ACTION);
+
+  // Discrete perturbation (stimulus onset): teleport + re-aim the target on the
+  // scheduled step, then reschedule. Logged as a target_jump event + perturbed=1
+  // so reaction time (L2) and evoked tracking recovery (L6) can be measured.
+  let perturbed = 0;
+  if (state.stepCount + 1 >= state.nextPerturbStep) {
+    state.targetX = randomRange(-0.7, 0.7);
+    state.targetY = randomRange(-0.5, 0.5);
+    const jumpAngle = randomRange(0, Math.PI * 2);
+    const jumpSpeed = randomRange(0.15, TARGET_MAX_SPEED);
+    state.targetVx = Math.cos(jumpAngle) * jumpSpeed;
+    state.targetVy = Math.sin(jumpAngle) * jumpSpeed;
+    perturbed = 1;
+    state.nextPerturbStep = state.stepCount + 1 + Math.floor(randomRange(PERTURB_MIN_GAP, PERTURB_MAX_GAP));
+    sessionEvents.push({
+      type: "target_jump", wall_t: round(performance.now(), 3), episode: episode + 1,
+      step: state.stepCount + 1, x: round(state.targetX, 6), y: round(state.targetY, 6),
+    });
+  }
 
   state.targetVx = clip(state.targetVx + randomRange(-TARGET_ACCEL_NOISE, TARGET_ACCEL_NOISE) * DT, -TARGET_MAX_SPEED, TARGET_MAX_SPEED);
   state.targetVy = clip(state.targetVy + randomRange(-TARGET_ACCEL_NOISE, TARGET_ACCEL_NOISE) * DT, -TARGET_MAX_SPEED, TARGET_MAX_SPEED);
@@ -408,6 +398,7 @@ function tick(): void {
     episode: episode + 1,
     step: state.stepCount,
     t: round(state.stepCount * DT, 6),
+    wall_t: round(performance.now(), 3),
     cursor_x: round(state.cursorX, 6),
     cursor_y: round(state.cursorY, 6),
     cursor_vx: round(state.cursorVx, 6),
@@ -425,6 +416,9 @@ function tick(): void {
     forward_offset: round(forwardOffset, 6),
     desired_forward_offset: round(desiredForwardOffset, 6),
     reward: round(reward, 6),
+    client_x: Math.round(rawClientX),
+    client_y: Math.round(rawClientY),
+    perturbed,
     source: "human-web",
   });
   updateSessionStats(frames[frames.length - 1]);
@@ -454,15 +448,12 @@ function resetState(): WorldState {
     prevActionX: 0,
     prevActionY: 0,
     consecutiveHits: 0,
+    nextPerturbStep: Math.floor(randomRange(PERTURB_MIN_GAP, PERTURB_MAX_GAP)),
   };
 }
 
 function renderLive(): void {
   drawArena(ctx, canvas.width, canvas.height, currentLiveFrame(), state.targetX, state.targetY, state.cursorX, state.cursorY);
-}
-
-function renderReplay(): void {
-  drawArena(replayCtx, replayCanvas.width, replayCanvas.height, replayFrames[replayIndex], null, null, null, null);
 }
 
 function currentLiveFrame(): Frame | undefined {
@@ -585,8 +576,26 @@ function sessionPayload(): { source: string; frames: Frame[]; meta: Record<strin
       best_distance: sessionStats.frameCount > 0 ? sessionStats.minDistance : 0,
       hit_frames: sessionStats.hitFrames,
       track_frames: sessionStats.trackFrames,
+      dpr: window.devicePixelRatio || 1,
+      viewport_w: window.innerWidth,
+      viewport_h: window.innerHeight,
+      pointer_type: "mouse",
+      perturbation_count: sessionEvents.filter((e) => e.type === "target_jump").length,
+      event_count: sessionEvents.length,
+      events: sessionEvents,
+      mouse_sample_count: mouseTrace.length,
+      mouse_hz_estimate: estimateMouseHz(),
+      mouse_trace: mouseTrace,
     },
   };
+}
+
+// Rough native mouse rate from the high-res trace timestamps (sanity check that
+// a 240Hz+ device is actually delivering 240Hz+ samples).
+function estimateMouseHz(): number {
+  if (mouseTrace.length < 20) return 0;
+  const span = mouseTrace[mouseTrace.length - 1].wall_t - mouseTrace[0].wall_t;
+  return span > 0 ? Math.round(((mouseTrace.length - 1) / span) * 1000) : 0;
 }
 
 function computeScore(rows: Frame[]): number {
@@ -628,215 +637,19 @@ function downloadSession(): void {
     updateMetrics(currentLiveFrame());
     return;
   }
-  downloadJsonl(frames, `human-web-${stamp()}.jsonl`);
-  statusMessage = "Downloaded JSONL session";
-  updateMetrics(currentLiveFrame());
-}
-
-async function uploadSession(): Promise<void> {
-  if (frames.length === 0) {
-    statusMessage = "No frames to upload";
-    updateMetrics(currentLiveFrame());
-    return;
-  }
-  statusMessage = "Uploading session";
-  updateMetrics(currentLiveFrame());
-  const response = await fetch(`${apiBase()}/api/sessions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(sessionPayload()),
-  });
-  if (!response.ok) {
-    const text = await response.text();
-    statusMessage = `Upload failed: ${response.status} ${text}`;
-    updateMetrics(currentLiveFrame());
-    return;
-  }
-  statusMessage = "Session uploaded";
-  updateMetrics(currentLiveFrame());
-  await refreshAdmin();
-}
-
-async function refreshAdmin(): Promise<void> {
-  await Promise.all([fetchSessions(), fetchAdminStats()]);
-}
-
-async function fetchSessions(): Promise<void> {
-  const response = await fetch(`${apiBase()}/api/sessions`);
-  if (!response.ok) {
-    statusMessage = `Session list failed: ${response.status}`;
-    updateMetrics(currentLiveFrame());
-    return;
-  }
-  const payload = (await response.json()) as { sessions: SessionSummary[] };
-  summaries = payload.sessions;
-  renderSessions();
-  if (selectedSessionId && !summaries.some((summary) => summary.session_id === selectedSessionId)) clearReplay();
-}
-
-async function fetchAdminStats(): Promise<void> {
-  const response = await fetch(`${apiBase()}/api/admin/stats`);
-  if (!response.ok) {
-    statusMessage = `Admin stats failed: ${response.status}`;
-    updateMetrics(currentLiveFrame());
-    return;
-  }
-  adminStats = (await response.json()) as AdminStats;
-  renderAdminStats();
-  renderLeaderboard();
-  statusMessage = `Loaded ${summaries.length} sessions`;
-  updateMetrics(currentLiveFrame());
-}
-
-function renderAdminStats(): void {
-  if (!adminStats) {
-    adminStatsEl.innerHTML = "<p>No stats yet.</p>";
-    return;
-  }
-  const sourceLines = adminStats.sources
-    .map(
-      (entry) =>
-        `<li>${entry.source}: ${entry.session_count} sessions / ${entry.frame_count} frames / avg ${entry.average_score.toFixed(1)}</li>`,
-    )
-    .join("");
-  adminStatsEl.innerHTML = `
-    <div class="stat-row"><span>Total sessions</span><strong>${adminStats.session_count}</strong></div>
-    <div class="stat-row"><span>Total frames</span><strong>${adminStats.stored_frame_count}</strong></div>
-    <div class="stat-row"><span>Average score</span><strong>${adminStats.average_score.toFixed(1)}</strong></div>
-    <div class="stat-row"><span>Top score</span><strong>${adminStats.top_score}</strong></div>
-    <div class="stat-row"><span>Minute uploads from you</span><strong>${adminStats.upload_limits.recent_uploads_from_ip}</strong></div>
-    <div class="footer-note">Rate limit: ${adminStats.upload_limits.minute_limit}/min, ${adminStats.upload_limits.hourly_limit}/hour</div>
-    <ul class="source-breakdown">${sourceLines}</ul>
-  `;
-}
-
-function renderLeaderboard(): void {
-  if (!adminStats) {
-    if (leaderboardRenderKey !== "") {
-      leaderboardEl.innerHTML = "";
-      leaderboardRenderKey = "";
-    }
-    return;
-  }
-  const nextKey = JSON.stringify(
-    adminStats.leaderboard.slice(0, 10).map((entry) => [entry.session_id, entry.player_name, entry.score, entry.frame_count]),
-  );
-  if (nextKey === leaderboardRenderKey) {
-    return;
-  }
-  leaderboardRenderKey = nextKey;
-  leaderboardEl.innerHTML = adminStats.leaderboard
-    .slice(0, 10)
-    .map(
-      (entry, index) =>
-        `<li><button class="leaderboard-button" data-session-id="${entry.session_id}"><strong>#${index + 1} ${entry.score} · ${entry.player_name ?? "anonymous"}</strong><span>${entry.source} · ${entry.frame_count} frames</span></button></li>`,
-    )
-    .join("");
-}
-
-function renderSessions(): void {
-  const nextKey = JSON.stringify(
-    summaries.slice(0, 20).map((summary) => [
-      summary.session_id,
-      summary.player_name,
-      summary.score,
-      summary.frame_count,
-      summary.session_id === selectedSessionId,
-    ]),
-  );
-  if (nextKey === sessionListRenderKey) {
-    return;
-  }
-  sessionListRenderKey = nextKey;
-  sessionListEl.innerHTML = summaries
-    .slice(0, 20)
-    .map((summary) => {
-      const selected = summary.session_id === selectedSessionId ? " selected" : "";
-      return `
-        <li class="session-item${selected}">
-          <button class="session-button" data-session-id="${summary.session_id}">
-            <strong>${summary.session_id}</strong>
-            <span>${summary.player_name ?? "anonymous"} · ${summary.score ?? 0} pts · ${summary.frame_count} frames</span>
-          </button>
-        </li>
-      `;
-    })
-    .join("");
-}
-
-async function loadReplay(sessionId: string): Promise<void> {
-  if (!sessionId) return;
-  const response = await fetch(`${apiBase()}/api/sessions/${sessionId}/jsonl`);
-  if (!response.ok) {
-    statusMessage = `Replay load failed: ${response.status}`;
-    updateMetrics(currentLiveFrame());
-    return;
-  }
-  const payload = (await response.json()) as { content: string };
-  replayFrames = payload.content
-    .split("\n")
-    .filter((line) => line.trim().length > 0)
-    .map((line) => JSON.parse(line) as Frame);
-  selectedSessionId = sessionId;
-  replayIndex = 0;
-  replayPlaying = false;
-  syncReplayControls();
-  renderSessions();
-  statusMessage = `Loaded replay ${sessionId}`;
-  updateMetrics(currentLiveFrame());
-}
-
-function clearReplay(): void {
-  selectedSessionId = null;
-  replayFrames = [];
-  replayIndex = 0;
-  replayPlaying = false;
-  syncReplayControls();
-  renderSessions();
-  statusMessage = "Replay cleared";
-  updateMetrics(currentLiveFrame());
-}
-
-function syncReplayControls(): void {
-  const hasReplay = replayFrames.length > 0;
-  replayToggleButton.disabled = !hasReplay;
-  replayDownloadButton.disabled = !hasReplay;
-  replaySlider.disabled = !hasReplay;
-  replaySlider.max = String(Math.max(0, replayFrames.length - 1));
-  replaySlider.value = String(replayIndex);
-  replayTitleEl.textContent = hasReplay ? `Replay ${selectedSessionId}` : "No Session Loaded";
-  replayToggleButton.textContent = replayPlaying ? "Pause" : "Play";
-  const frame = replayFrames[replayIndex];
-  replayStepEl.textContent = hasReplay ? `step ${frame.step} / ${replayFrames[replayFrames.length - 1].step}` : "step 0 / 0";
-  replayDistanceEl.textContent = hasReplay ? `distance ${frame.distance.toFixed(3)} · forward ${frame.forward_offset.toFixed(3)}` : "distance 0.000";
-}
-
-function toggleReplay(): void {
-  if (replayFrames.length === 0) return;
-  replayPlaying = !replayPlaying;
-  replayTimestamp = 0;
-  syncReplayControls();
-}
-
-async function downloadReplayTrace(): Promise<void> {
-  if (replayFrames.length === 0 || !selectedSessionId) return;
-  downloadJsonl(replayFrames, `${selectedSessionId}.jsonl`);
-}
-
-function downloadJsonl(rows: Frame[], filename: string): void {
-  const jsonl = rows.map((row) => JSON.stringify(row)).join("\n");
-  const blob = new Blob([jsonl], { type: "application/jsonl" });
+  // Full session as one JSON file: frames + high-res mouse_trace + event log +
+  // meta. (No server; the player sends this file back.)
+  const blob = new Blob([JSON.stringify(sessionPayload())], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
-  anchor.download = filename;
+  anchor.download = `aim-session-${playerName}-${stamp()}.json`;
   anchor.click();
   URL.revokeObjectURL(url);
+  statusMessage = `Downloaded: ${frames.length} frames, ${mouseTrace.length} mouse samples, ${sessionEvents.length} events`;
+  updateMetrics(currentLiveFrame());
 }
 
-function apiBase(): string {
-  return apiInput.value.replace(/\/$/, "");
-}
 
 function worldToCanvas(worldX: number, worldY: number, width: number, height: number): { x: number; y: number } {
   return {
