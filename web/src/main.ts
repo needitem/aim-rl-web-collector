@@ -439,7 +439,14 @@ function tick(): void {
   });
   updateSessionStats(frames[frames.length - 1]);
 
-  if (state.stepCount >= EPISODE_STEPS || state.consecutiveHits >= 8) {
+  // Episode ends on TIME only. It used to also end at consecutiveHits >= 8
+  // ("target acquired") - but once the difficulty was eased, the player caught
+  // the target within ~0.13s and the episode reset after ~42 steps, before the
+  // first jump (min 45 steps) could ever fire. That starved the whole L6
+  // stimulus (only 11 of 120 episodes got a jump). Running the full 300 steps
+  // (5s) lets 2-4 jumps fire per episode and keeps the player tracking through
+  // them - which is the reaction/recovery signal this collector exists for.
+  if (state.stepCount >= EPISODE_STEPS) {
     episode += 1;
     state = resetState();
     pointerX = state.cursorX;
