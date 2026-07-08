@@ -137,9 +137,12 @@ const EPISODE_STEPS = 300;
 // tracking recovery (L6) - the continuous random walk alone has no such event.
 const PERTURB_MIN_GAP = 45;   // steps (~0.75 s) minimum before a jump can fire
 const PERTURB_MAX_GAP = 150;  // steps (~2.5 s) maximum
+const ROUND_EPISODES = 6;     // one round = 6 episodes, then auto-stop with a final score
 
 let running = false;
 let episode = 0;
+let roundStartEpisode = 0;
+let bestScore = Number(window.localStorage.getItem("aim-rl-best-score") || "0");
 let frames: Frame[] = [];
 let pointerX = 0;
 let pointerY = 0;
@@ -163,9 +166,10 @@ app.innerHTML = `
       <p class="eyebrow">Browser Collector</p>
       <h1>Aim RL Web Arena</h1>
       <p class="lede">
-        Track the moving target. The target jumps at random intervals — chase it.
-        When you're done, <strong>Download JSONL</strong> and send the file. Mouse is
-        captured at your device's native rate (240Hz+ on gaming mice).
+        Track the moving target — it jumps at random intervals, chase it back.
+        A <strong>round is ${ROUND_EPISODES} episodes</strong>; then it stops and shows your
+        score. When you're done, <strong>Download JSONL</strong> and send the file.
+        Mouse is captured at your device's native rate (240Hz+ on gaming mice).
       </p>
     </div>
 
@@ -192,6 +196,7 @@ app.innerHTML = `
         <div class="metric"><span>Distance</span><strong id="metric-distance">0.000</strong></div>
         <div class="metric"><span>Lead Offset</span><strong id="metric-forward">0.000</strong></div>
         <div class="metric"><span>Score</span><strong id="metric-score">0</strong></div>
+        <div class="metric"><span>Best</span><strong id="metric-best">0</strong></div>
       </div>
     </div>
 
@@ -221,6 +226,7 @@ const framesEl = getRequired<HTMLElement>("#metric-frames");
 const distanceEl = getRequired<HTMLElement>("#metric-distance");
 const forwardEl = getRequired<HTMLElement>("#metric-forward");
 const scoreEl = getRequired<HTMLElement>("#metric-score");
+const bestEl = getRequired<HTMLElement>("#metric-best");
 const statusEl = getRequired<HTMLElement>("#status-line");
 
 canvas.addEventListener("pointermove", (event) => {
@@ -310,8 +316,13 @@ function loop(timestamp: number): void {
 
 function toggleRun(): void {
   running = !running;
-  statusMessage = running ? "Collecting frames" : "Paused";
   toggleRunButton.textContent = running ? "Pause" : "Start";
+  if (running) {
+    const epInRound = Math.min(episode - roundStartEpisode + 1, ROUND_EPISODES);
+    statusMessage = `Round in progress — episode ${epInRound}/${ROUND_EPISODES}`;
+  } else {
+    statusMessage = "Paused";
+  }
   updateMetrics(lastFrame());
 }
 
@@ -424,9 +435,22 @@ function tick(): void {
   updateSessionStats(frames[frames.length - 1]);
 
   if (state.stepCount >= EPISODE_STEPS || state.consecutiveHits >= 8) {
-    resetEpisode();
-    running = true;
-    toggleRunButton.textContent = "Pause";
+    episode += 1;
+    state = resetState();
+    pointerX = state.cursorX;
+    pointerY = state.cursorY;
+    if (episode - roundStartEpisode >= ROUND_EPISODES) {
+      // Round over: stop, show the final score, update best.
+      running = false;
+      const finalScore = currentScore();
+      if (finalScore > bestScore) {
+        bestScore = finalScore;
+        window.localStorage.setItem("aim-rl-best-score", String(bestScore));
+      }
+      roundStartEpisode = episode;
+      toggleRunButton.textContent = "Start";
+      statusMessage = `Round complete — Score ${finalScore} (best ${bestScore}) · Download JSONL, or Start again`;
+    }
   }
 
   updateMetrics(lastFrame());
@@ -558,6 +582,7 @@ function updateMetrics(frame?: Frame): void {
   distanceEl.textContent = frame ? frame.distance.toFixed(3) : "0.000";
   forwardEl.textContent = frame ? frame.forward_offset.toFixed(3) : "0.000";
   scoreEl.textContent = String(currentScore());
+  bestEl.textContent = String(bestScore);
   statusEl.textContent = statusMessage;
 }
 
