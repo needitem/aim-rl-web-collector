@@ -119,12 +119,17 @@ type SessionStats = {
 const DT = 1 / 60;
 const WORLD_X = 1.0;
 const WORLD_Y = 1.0;
-const TARGET_RADIUS = 0.07;
-const HIT_RADIUS = 0.03;
+// Zones and target speed are tuned for playability: the point is a human who
+// can actually keep up (so tracking error reflects *reacting*, not flailing),
+// not a twitch-aim stress test. The discrete jumps below are what force the
+// reaction (L2) / evoked-recovery (L6) signal - the continuous drift is kept
+// gentle so the player settles into good tracking between jumps.
+const TARGET_RADIUS = 0.11;   // track zone (was 0.07) - bigger, easier to stay on
+const HIT_RADIUS = 0.05;      // hit zone (was 0.03)
 const MAX_CURSOR_SPEED = 1.4;
 const MAX_ACTION = 0.09;
-const TARGET_MAX_SPEED = 0.55;
-const TARGET_ACCEL_NOISE = 0.14;
+const TARGET_MAX_SPEED = 0.32; // was 0.55 - slower target, trackable by hand
+const TARGET_ACCEL_NOISE = 0.08; // was 0.14 - less erratic wander between jumps
 const REWARD_LEAD_TIME = 0.18;
 const REWARD_LEAD_WEIGHT = 0.85;
 const REWARD_FORWARD_WEIGHT = 0.45;
@@ -615,12 +620,23 @@ function sessionPayload(): { source: string; frames: Frame[]; meta: Record<strin
   };
 }
 
-// Rough native mouse rate from the high-res trace timestamps (sanity check that
-// a 240Hz+ device is actually delivering 240Hz+ samples).
+// Native mouse rate from the high-res trace timestamps (sanity check that a
+// 240Hz+ device is actually delivering 240Hz+ samples). Uses the MEDIAN
+// inter-sample interval during active movement, not samples/total-span: the
+// mouse emits no events while idle, so the gross average is dragged down by
+// the gaps between movements (a 125Hz mouse would read ~50Hz that way). The
+// median of consecutive-sample gaps reflects the true polling rate when moving.
 function estimateMouseHz(): number {
   if (mouseTrace.length < 20) return 0;
-  const span = mouseTrace[mouseTrace.length - 1].wall_t - mouseTrace[0].wall_t;
-  return span > 0 ? Math.round(((mouseTrace.length - 1) / span) * 1000) : 0;
+  const gaps: number[] = [];
+  for (let i = 1; i < mouseTrace.length; i++) {
+    const dt = mouseTrace[i].wall_t - mouseTrace[i - 1].wall_t;
+    if (dt > 0) gaps.push(dt);
+  }
+  if (gaps.length === 0) return 0;
+  gaps.sort((a, b) => a - b);
+  const median = gaps[Math.floor(gaps.length / 2)];
+  return median > 0 ? Math.round(1000 / median) : 0;
 }
 
 function computeScore(rows: Frame[]): number {
